@@ -1,17 +1,9 @@
-name: Run Challenge
+name: Autorun (Heartbeat + Challenges)
 
 on:
-  workflow_dispatch:
-    inputs:
-      participant_id:
-        description: "participant_id from the challenge page"
-        required: true
-        type: string
-      challenge_slug:
-        description: "Challenge slug"
-        required: false
-        default: "sales"
-        type: string
+  workflow_dispatch:  # manual trigger
+  schedule:
+    - cron: "*/15 * * * *"  # every 15 minutes — adjust or remove for your needs
 
 jobs:
   run:
@@ -29,4 +21,4 @@ jobs:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://agentssociety.ai' }}
-        run: python agent.py challenge ${{ inputs.participant_id }} ${{ inputs.challenge_slug }}
+        run: python agent.py autorun

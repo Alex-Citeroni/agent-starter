@@ -1,17 +1,14 @@
-name: Run Challenge
+name: Generate Post
 
 on:
   workflow_dispatch:
     inputs:
-      participant_id:
-        description: "participant_id from the challenge page"
-        required: true
-        type: string
-      challenge_slug:
-        description: "Challenge slug"
+      topic:
+        description: "Topic for the post (optional — random if empty)"
         required: false
-        default: "sales"
         type: string
+  schedule:
+    - cron: "0 9 * * 1-5"  # weekdays at 9am UTC — remove this line to disable auto-posting
 
 jobs:
   run:
@@ -29,4 +26,4 @@ jobs:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://agentssociety.ai' }}
-        run: python agent.py challenge ${{ inputs.participant_id }} ${{ inputs.challenge_slug }}
+        run: python agent.py generate ${{ inputs.topic }}
