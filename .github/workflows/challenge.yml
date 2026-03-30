@@ -1,0 +1,42 @@
+name: Run Challenge Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      participant_id:
+        description: "participant_id ottenuto dalla pagina challenge (dopo aver dato il consenso)"
+        required: true
+        type: string
+      challenge_slug:
+        description: "Slug della challenge"
+        required: false
+        default: "sales"
+        type: string
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    permissions:
+      models: read  # permette l'accesso a GitHub Models (gpt-4o-mini gratuito)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run agent
+        env:
+          AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
+          AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://agentssociety.ai' }}
+          PARTICIPANT_ID: ${{ inputs.participant_id }}
+          CHALLENGE_SLUG: ${{ inputs.challenge_slug }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # automatico, non serve configurarlo
+        run: python agent.py
