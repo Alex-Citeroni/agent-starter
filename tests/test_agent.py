@@ -5,6 +5,7 @@ import sys
 import json
 import tempfile
 import pytest
+import requests
 from unittest.mock import patch, MagicMock
 
 # Add parent dir to path so we can import agent
@@ -19,6 +20,7 @@ import agent
 
 
 # ── parse_scores ───────────────────────────────────────────────
+
 
 class TestParseScores:
     def test_valid_scores(self):
@@ -54,11 +56,23 @@ Total Score: 42/60"""
     def test_empty_text(self):
         assert agent.parse_scores("") is None
 
-    def test_invalid_scores_ignored(self):
+    def test_out_of_range_score_zeroed(self):
         text = "Qualification: 15/10\nOutreach: 7/10\nDiscovery: 6/10\nSolution: 8/10\nObjection Handling: 5/10\nClosing: 7/10"
         result = agent.parse_scores(text)
-        # 15 > 10 but regex still matches the digit — parse_scores doesn't validate range
         assert result is not None
+        assert result["qualification"] == 0  # 15 > max 10, so rejected and zeroed
+        assert result["outreach"] == 7
+
+    def test_custom_categories(self):
+        categories = [
+            {"key": "clarity", "label": "Clarity", "max": 10},
+            {"key": "creativity", "label": "Creativity", "max": 10},
+        ]
+        text = "Clarity: 8/10\nCreativity: 9/10"
+        result = agent.parse_scores(text, categories=categories)
+        assert result is not None
+        assert result["clarity"] == 8
+        assert result["creativity"] == 9
 
     def test_scores_in_surrounding_text(self):
         text = """Bravo! Ecco la mia valutazione:
@@ -79,6 +93,7 @@ Commento: Ottimo lavoro!
 
 # ── load_challenge_prompt ──────────────────────────────────────
 
+
 class TestLoadChallengePrompt:
     def test_default_sales_prompt(self):
         prompt = agent.load_challenge_prompt("sales")
@@ -86,7 +101,9 @@ class TestLoadChallengePrompt:
         assert "GestioCarni Pro" in prompt
 
     def test_custom_env_vars(self):
-        with patch.dict(os.environ, {"PRODUCT_NAME": "TestProduct", "PRODUCT_PRICE": "Free"}):
+        with patch.dict(
+            os.environ, {"PRODUCT_NAME": "TestProduct", "PRODUCT_PRICE": "Free"}
+        ):
             prompt = agent.load_challenge_prompt("sales")
             assert "TestProduct" in prompt
             assert "Free" in prompt
@@ -103,8 +120,12 @@ class TestLoadChallengePrompt:
                     with patch("agent.os.path.exists", return_value=True):
                         with patch("builtins.open", create=True) as mock_open:
                             mock_open.return_value.__enter__ = lambda s: s
-                            mock_open.return_value.__exit__ = MagicMock(return_value=False)
-                            mock_open.return_value.read = lambda: "Custom prompt for testing"
+                            mock_open.return_value.__exit__ = MagicMock(
+                                return_value=False
+                            )
+                            mock_open.return_value.read = (
+                                lambda: "Custom prompt for testing"
+                            )
                             prompt = agent.load_challenge_prompt("custom")
                             assert prompt == "Custom prompt for testing"
 
@@ -114,6 +135,7 @@ class TestLoadChallengePrompt:
 
 
 # ── API helper ─────────────────────────────────────────────────
+
 
 class TestApi:
     @patch("agent.requests.get")
@@ -130,7 +152,10 @@ class TestApi:
     @patch("agent.requests.post")
     def test_post_request(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        mock_post.return_value.json.return_value = {"success": True, "data": {"id": "123"}}
+        mock_post.return_value.json.return_value = {
+            "success": True,
+            "data": {"id": "123"},
+        }
         mock_post.return_value.raise_for_status = MagicMock()
 
         result = agent.api("POST", "/api/v1/agents/post", {"text": "hello"})
@@ -148,6 +173,7 @@ class TestApi:
 
 
 # ── LLM ────────────────────────────────────────────────────────
+
 
 class TestCallLLM:
     @patch("agent.requests.post")
@@ -185,6 +211,7 @@ class TestCallLLM:
 
 
 # ── CLI dispatch ───────────────────────────────────────────────
+
 
 class TestCLI:
     @patch("agent.cmd_info")
@@ -248,6 +275,7 @@ class TestCLI:
 
 # ── DM dispatch ────────────────────────────────────────────────
 
+
 class TestDMDispatch:
     @patch("agent.cmd_dm_list")
     def test_dm_list(self, mock_list):
@@ -267,6 +295,7 @@ class TestDMDispatch:
 
 # ── Reactions validation ───────────────────────────────────────
 
+
 class TestReactions:
     def test_valid_reactions_list(self):
         assert "❤️" in agent.REACTIONS
@@ -282,6 +311,7 @@ class TestReactions:
 
 # ── Autorun ────────────────────────────────────────────────────
 
+
 class TestAutorun:
     @patch("agent.cmd_challenge")
     @patch("agent.api")
@@ -294,17 +324,21 @@ class TestAutorun:
                 "status": "active",
                 "stats": {},
                 "unread_notifications": 1,
-                "notifications": [{
-                    "id": "n1",
-                    "type": "challenge_invitation",
-                    "comment_preview": json.dumps({
-                        "challenge_slug": "sales",
-                        "challenge_title": "Sales Challenge",
-                        "participant_id": "p123",
-                    }),
-                    "created_at": "2026-01-01",
-                    "actor": {"username": "owner"},
-                }],
+                "notifications": [
+                    {
+                        "id": "n1",
+                        "type": "challenge_invitation",
+                        "comment_preview": json.dumps(
+                            {
+                                "challenge_slug": "sales",
+                                "challenge_title": "Sales Challenge",
+                                "participant_id": "p123",
+                            }
+                        ),
+                        "created_at": "2026-01-01",
+                        "actor": {"username": "owner"},
+                    }
+                ],
             },
         }
         agent.cmd_autorun()
@@ -315,10 +349,23 @@ class TestAutorun:
         mock_api.return_value = {
             "success": True,
             "data": {
-                "agent_id": "a1", "username": "bot", "status": "active",
-                "stats": {}, "unread_notifications": 0, "notifications": [],
+                "agent_id": "a1",
+                "username": "bot",
+                "status": "active",
+                "stats": {},
+                "unread_notifications": 0,
+                "notifications": [],
             },
         }
+        agent.cmd_autorun()  # should not raise
+
+    @patch("agent.api")
+    def test_autorun_heartbeat_failure(self, mock_api):
+        """Autorun should not crash when heartbeat fails."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error"
+        mock_api.side_effect = requests.exceptions.HTTPError(response=mock_resp)
         agent.cmd_autorun()  # should not raise
 
     @patch("agent.cmd_autorun")
