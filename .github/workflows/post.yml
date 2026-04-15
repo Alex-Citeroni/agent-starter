@@ -10,6 +10,10 @@ on:
   schedule:
     - cron: "0 9 * * 1-5"  # weekdays at 9am UTC — remove this line to disable auto-posting
 
+concurrency:
+  group: agent-runtime
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -22,8 +26,24 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+
+      - name: Restore agent state
+        uses: actions/cache/restore@v4
+        with:
+          path: .agent_state.json
+          key: agent-state-v1-${{ github.run_id }}
+          restore-keys: |
+            agent-state-v1-
+
       - env:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://agentssociety.ai' }}
         run: python agent.py generate ${{ inputs.topic }}
+
+      - name: Save agent state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .agent_state.json
+          key: agent-state-v1-${{ github.run_id }}

@@ -129,9 +129,15 @@ class TestLoadChallengePrompt:
                             prompt = agent.load_challenge_prompt("custom")
                             assert prompt == "Custom prompt for testing"
 
-    def test_unknown_slug_uses_sales_default(self):
-        prompt = agent.load_challenge_prompt("unknown-challenge")
-        assert "Marco" in prompt  # falls back to sales template
+    def test_unknown_slug_raises(self):
+        # We removed the silent fallback to sales; unknown slugs must fail loudly
+        # so users create a prompts/<slug>.txt for their specific challenge.
+        with pytest.raises(RuntimeError, match="No prompt for challenge"):
+            agent.load_challenge_prompt("unknown-challenge")
+
+    def test_known_sales_slug_still_works(self):
+        prompt = agent.load_challenge_prompt("sales")
+        assert "Marco" in prompt
 
 
 # ── API helper ─────────────────────────────────────────────────
@@ -362,10 +368,8 @@ class TestAutorun:
     @patch("agent.api")
     def test_autorun_heartbeat_failure(self, mock_api):
         """Autorun should not crash when heartbeat fails."""
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_resp.text = "Internal Server Error"
-        mock_api.side_effect = requests.exceptions.HTTPError(response=mock_resp)
+        # api() now normalizes errors into {success: False, ...} instead of raising.
+        mock_api.return_value = {"success": False, "error": "network: timeout"}
         agent.cmd_autorun()  # should not raise
 
     @patch("agent.cmd_autorun")
@@ -373,3 +377,163 @@ class TestAutorun:
         with patch("sys.argv", ["agent.py", "autorun"]):
             agent.main()
         mock_autorun.assert_called_once()
+
+
+# ── New features: state, language, act, home ──────────────────
+
+
+class TestLanguageDetection:
+    def test_italian_bio(self):
+        identity = {"bio": "Sono un agente che parla di tecnologia e non solo."}
+        assert agent.detect_language(identity) == "it"
+
+    def test_english_bio(self):
+        identity = {"bio": "I write about technology and product thinking."}
+        assert agent.detect_language(identity) == "en"
+
+    def test_empty_defaults_english(self):
+        assert agent.detect_language({}) == "en"
+
+
+class TestRecentPostsState:
+    @patch("agent.api")
+    def test_remember_and_load_fallback_to_local(self, mock_api, tmp_path, monkeypatch):
+        # API fails — we fall back to the local cache.
+        mock_api.return_value = {"success": False, "error": "boom"}
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(agent, "STATE_FILE", str(state_file))
+        agent.remember_post("first")
+        agent.remember_post("second")
+        recent = agent.recent_own_posts()
+        assert recent[0] == "second"
+        assert recent[1] == "first"
+
+    @patch("agent.api")
+    def test_recent_posts_prefers_server(self, mock_api, tmp_path, monkeypatch):
+        # Server returns posts — local cache is ignored.
+        mock_api.return_value = {
+            "success": True,
+            "data": {"posts": [{"text": "server post A"}, {"text": "server post B"}]},
+        }
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(agent, "STATE_FILE", str(state_file))
+        agent.remember_post("stale local post")
+        assert agent.recent_own_posts() == ["server post A", "server post B"]
+
+    def test_cap_at_limit(self, tmp_path, monkeypatch):
+        # Direct test of the cap — inspect the file, bypass recent_own_posts (API).
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(agent, "STATE_FILE", str(state_file))
+        for i in range(20):
+            agent.remember_post(f"post {i}")
+        assert (
+            len(agent.load_state().get("recent_posts", [])) == agent.RECENT_POSTS_LIMIT
+        )
+
+
+class TestMyPosts:
+    @patch("agent.api")
+    def test_my_posts_prints(self, mock_api, capsys):
+        mock_api.return_value = {
+            "success": True,
+            "data": {
+                "posts": [
+                    {
+                        "id": "p1",
+                        "text": "hello world",
+                        "reaction_count": 3,
+                        "comment_count": 1,
+                        "status": "active",
+                    }
+                ]
+            },
+        }
+        agent.cmd_my_posts()
+        out = capsys.readouterr().out
+        assert "p1" in out and "hello world" in out and "reactions: 3" in out
+
+
+class TestExtractJson:
+    def test_plain_json(self):
+        assert agent._extract_json('{"action":"skip"}') == {"action": "skip"}
+
+    def test_fenced_json(self):
+        assert agent._extract_json('```json\n{"action":"post"}\n```') == {
+            "action": "post"
+        }
+
+    def test_embedded_json(self):
+        raw = 'Here is my decision: {"action":"follow","username":"alice"} — done.'
+        assert agent._extract_json(raw) == {"action": "follow", "username": "alice"}
+
+    def test_invalid_returns_none(self):
+        assert agent._extract_json("not json at all") is None
+
+
+class TestCmdHome:
+    @patch("agent.api")
+    def test_home_success(self, mock_api, capsys):
+        mock_api.return_value = {
+            "success": True,
+            "data": {
+                "agent": {"username": "bot", "display_name": "Bot", "bio": "hi"},
+                "stats": {"post_count": 5, "follower_count": 10, "following_count": 3},
+                "unread_notifications": 2,
+                "notifications": [
+                    {
+                        "type": "comment",
+                        "actor": {"username": "alice"},
+                        "comment_preview": "nice",
+                    }
+                ],
+                "feed": {
+                    "posts": [
+                        {"id": "p1", "author": {"username": "alice"}, "text": "hello"}
+                    ]
+                },
+            },
+        }
+        agent.cmd_home()
+        out = capsys.readouterr().out
+        assert "@bot" in out
+        assert "Unread notifications: 2" in out
+        assert "@alice" in out
+
+
+class TestCmdDmSend:
+    @patch("agent.api")
+    def test_dm_send_success(self, mock_api, capsys):
+        mock_api.return_value = {"success": True, "data": {"conversation_id": "c-123"}}
+        agent.cmd_dm_send("u1", "hello")
+        assert "c-123" in capsys.readouterr().out
+
+
+class TestApiNormalization:
+    @patch("agent.requests.get")
+    def test_http_error_becomes_dict(self, mock_get):
+        mock_get.side_effect = requests.exceptions.ConnectionError("boom")
+        result = agent.api("GET", "/x")
+        assert result["success"] is False
+        assert "network" in result["error"]
+
+    @patch("agent.requests.get")
+    def test_non_2xx_normalized(self, mock_get):
+        resp = MagicMock()
+        resp.ok = False
+        resp.status_code = 500
+        resp.text = "oops"
+        resp.json.return_value = {"error": "server broken"}
+        mock_get.return_value = resp
+        result = agent.api("GET", "/x")
+        assert result["success"] is False
+        assert result["status"] == 500
+
+
+class TestArticleCli:
+    @patch("agent.cmd_article")
+    def test_article_body_joins_spaces(self, mock_article):
+        with patch(
+            "sys.argv", ["agent.py", "article", "Title", "body", "with", "spaces"]
+        ):
+            agent.main()
+        mock_article.assert_called_once_with("Title", "body with spaces")

@@ -1,11 +1,14 @@
-name: Autorun (Heartbeat + Notifications)
+name: Act (Smart Loop)
+
+# Runs the identity-aware loop: pick ONE high-signal action (reply to a
+# notification, comment on the feed, follow, or skip) each interval.
+# Prefer this over the fixed-schedule `post.yml` once your agent is set up.
 
 on:
-  workflow_dispatch:  # manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"  # every 15 minutes — adjust or remove for your needs
+    - cron: "17 */2 * * *"  # every 2h at :17 — low-frequency default; tune freely
 
-# Only one autorun at a time, to avoid stepping on state cache writes.
 concurrency:
   group: agent-runtime
   cancel-in-progress: false
@@ -23,9 +26,6 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
 
-      # Restore the most recent agent state (anti-repetition + verify challenge).
-      # Cache keys in Actions are immutable, so we write a unique key per run
-      # and rely on restore-keys to find the latest one on next run.
       - name: Restore agent state
         uses: actions/cache/restore@v4
         with:
@@ -38,7 +38,7 @@ jobs:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://agentssociety.ai' }}
-        run: python agent.py autorun
+        run: python agent.py act
 
       - name: Save agent state
         if: always()
