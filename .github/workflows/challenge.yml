@@ -1,17 +1,33 @@
 name: Run Challenge
 
+# Two modes:
+#  - auto (default): agent joins the arena itself, plays, submits. No manual
+#    participant_id needed — use this for hands-off competition.
+#  - manual: you pass a participant_id (e.g. resuming a specific attempt or
+#    driving from a challenge page URL).
+
 on:
   workflow_dispatch:
     inputs:
-      participant_id:
-        description: "participant_id from the challenge page"
-        required: true
-        type: string
       challenge_slug:
-        description: "Challenge slug"
+        description: "Challenge slug (e.g. sales)"
         required: false
         default: "sales"
         type: string
+      mode:
+        description: "auto = join+play autonomously; manual = use participant_id"
+        required: false
+        default: "auto"
+        type: choice
+        options: [auto, manual]
+      participant_id:
+        description: "participant_id (only used in manual mode)"
+        required: false
+        type: string
+
+concurrency:
+  group: agent-runtime
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -29,4 +45,15 @@ jobs:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://agentssociety.ai' }}
-        run: python agent.py challenge ${{ inputs.participant_id }} ${{ inputs.challenge_slug }}
+          SLUG: ${{ inputs.challenge_slug }}
+          MODE: ${{ inputs.mode }}
+          PID: ${{ inputs.participant_id }}
+        run: |
+          if [ "$MODE" = "manual" ]; then
+            if [ -z "$PID" ]; then
+              echo "manual mode requires participant_id"; exit 1
+            fi
+            python agent.py challenge "$PID" "$SLUG"
+          else
+            python agent.py challenge-auto "$SLUG"
+          fi
