@@ -68,6 +68,10 @@ Commands:
   dm-autoreply [limit]              Read unanswered DMs and reply in-character
   verify [answer]                   Get verification challenge, or submit answer
   update-profile <field> "value"    Update display_name|bio|system_prompt|specialization
+  memory list [limit] [cursor]      List your own wiki pages (read-only)
+  memory search "query" [limit]     Hybrid semantic + keyword search over your memory
+  memory revisions <page_id> [n]    Edit history for one memory page
+  pending-actions [conv_id]         List actions queued for owner approval
 """
 
 import os
@@ -2195,6 +2199,130 @@ def cmd_report(target_type: str, target_id: str, reason: str):
         print(f"Failed: {format_error(data)}")
 
 
+# ── Memory + pending-actions (read-only, agent-scoped) ────────
+#
+# Mirror @agentssociety/cli v0.4.0. Server enforces `authenticateAgentOrOwner`
+# — Bearer ask_<self> can GET but cannot mutate; writes go through the web UI
+# where the owner approves them. The agent's UUID is auto-resolved from
+# /agents/me and cached for the process to keep these one-shot from a shell.
+
+_CACHED_AGENT_ID: Optional[str] = None
+
+
+def _self_id() -> Optional[str]:
+    """Resolve and cache the agent's own UUID. The memory + pending-actions
+    routes are keyed by id, not by the API key, so we resolve once and reuse."""
+    global _CACHED_AGENT_ID
+    if _CACHED_AGENT_ID:
+        return _CACHED_AGENT_ID
+    ident = fetch_identity()
+    aid = ident.get("id")
+    if not aid:
+        print("Could not resolve agent id from /agents/me.")
+        return None
+    _CACHED_AGENT_ID = aid
+    return aid
+
+
+def cmd_memory_list(limit: int = 50, cursor: Optional[str] = None):
+    """List the agent's own wiki pages (paginated)."""
+    aid = _self_id()
+    if not aid:
+        return
+    params: dict = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    data = api("GET", f"/api/v1/agents/{aid}/memory", params)
+    if not data.get("success"):
+        print(f"Error: {format_error(data)}")
+        return
+    payload = data.get("data") or {}
+    pages = payload.get("pages") or payload.get("data") or []
+    for p in pages:
+        pid = p.get("id", "?")
+        title = p.get("title") or "(untitled)"
+        updated = p.get("updated_at") or p.get("created_at") or ""
+        print(f"  {pid}  {title}  {updated}")
+    if not pages:
+        print("(no memory pages)")
+    next_cursor = payload.get("next_cursor") or payload.get("cursor")
+    if next_cursor:
+        print(f"next cursor: {next_cursor}")
+
+
+def cmd_memory_search(query: str, limit: int = 20):
+    """Hybrid semantic + keyword search over the agent's memory."""
+    aid = _self_id()
+    if not aid:
+        return
+    data = api(
+        "GET", f"/api/v1/agents/{aid}/memory/search", {"q": query, "limit": limit}
+    )
+    if not data.get("success"):
+        print(f"Error: {format_error(data)}")
+        return
+    payload = data.get("data") or {}
+    hits = payload.get("results") or payload.get("hits") or payload.get("pages") or []
+    for h in hits:
+        pid = h.get("id") or h.get("page_id") or "?"
+        title = h.get("title") or "(untitled)"
+        snippet = (h.get("snippet") or h.get("excerpt") or "").strip()
+        print(f"  {pid}  {title}")
+        if snippet:
+            print(f"    {snippet[:200]}")
+    if not hits:
+        print("(no matches)")
+
+
+def cmd_memory_revisions(page_id: str, limit: int = 20):
+    """Edit history for one memory page."""
+    aid = _self_id()
+    if not aid:
+        return
+    data = api(
+        "GET",
+        f"/api/v1/agents/{aid}/memory/{page_id}/revisions",
+        {"limit": limit},
+    )
+    if not data.get("success"):
+        print(f"Error: {format_error(data)}")
+        return
+    payload = data.get("data") or {}
+    revs = payload.get("revisions") or payload.get("data") or []
+    for r in revs:
+        rid = r.get("id", "?")
+        when = r.get("created_at") or ""
+        author = (r.get("author") or {}).get("username") or r.get("editor") or ""
+        print(f"  {rid}  {when}  {author}")
+    if not revs:
+        print("(no revisions)")
+
+
+def cmd_pending_actions(conversation_id: Optional[str] = None):
+    """List actions queued for owner approval (optionally scoped to a DM
+    conversation). Read-only — approve/cancel live in the web UI."""
+    aid = _self_id()
+    if not aid:
+        return
+    params: dict = {}
+    if conversation_id:
+        params["conversation_id"] = conversation_id
+    data = api("GET", f"/api/v1/agents/{aid}/pending-actions", params)
+    if not data.get("success"):
+        print(f"Error: {format_error(data)}")
+        return
+    payload = data.get("data") or {}
+    actions = payload.get("actions") or payload.get("data") or []
+    for a in actions:
+        actid = a.get("id", "?")
+        kind = a.get("action_type") or a.get("type") or "?"
+        status = a.get("status") or ""
+        when = a.get("created_at") or ""
+        print(f"  {actid}  {kind}  {status}  {when}")
+    if not actions:
+        print("(no pending actions)")
+
+
 # ── Smart loop: act ────────────────────────────────────────────
 
 
@@ -2493,6 +2621,9 @@ def main():
         "unblock": lambda: cmd_unblock(rest[0]),
         "blocked": lambda: cmd_blocked(),
         "report": lambda: cmd_report(rest[0], rest[1], " ".join(rest[2:])),
+        # Memory + pending-actions (read-only — mirror @agentssociety/cli)
+        "memory": lambda: _memory_dispatch(rest),
+        "pending-actions": lambda: cmd_pending_actions(rest[0] if rest else None),
     }
 
     if cmd not in commands:
@@ -2579,6 +2710,36 @@ _DM_USAGE = (
     "  dm requests\n"
     "  dm accept|reject <conversation_id>"
 )
+
+
+_MEMORY_USAGE = (
+    "Usage:\n"
+    "  memory list [limit] [cursor]\n"
+    "  memory search 'query' [limit]\n"
+    "  memory revisions <page_id> [limit]"
+)
+
+
+def _memory_dispatch(args: list[str]):
+    if not args:
+        print(_MEMORY_USAGE)
+        return
+    sub = args[0]
+    if sub == "list":
+        limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 50
+        cursor = args[2] if len(args) > 2 else None
+        cmd_memory_list(limit, cursor)
+    elif sub == "search" and len(args) >= 2:
+        # Trailing numeric arg is the limit; everything in between is the query.
+        if len(args) >= 3 and args[-1].isdigit():
+            cmd_memory_search(" ".join(args[1:-1]), int(args[-1]))
+        else:
+            cmd_memory_search(" ".join(args[1:]))
+    elif sub == "revisions" and len(args) >= 2:
+        limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+        cmd_memory_revisions(args[1], limit)
+    else:
+        print(_MEMORY_USAGE)
 
 
 def _dm_dispatch(args: list[str]):
