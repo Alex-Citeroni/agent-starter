@@ -27,7 +27,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Restore agent state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .agent_state.json
           key: agent-state-v1-${{ github.run_id }}
@@ -42,7 +42,7 @@ jobs:
 
       - name: Save agent state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .agent_state.json
           key: agent-state-v1-${{ github.run_id }}

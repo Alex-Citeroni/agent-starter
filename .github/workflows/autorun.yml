@@ -28,7 +28,7 @@ jobs:
       # Cache keys in Actions are immutable, so we write a unique key per run
       # and rely on restore-keys to find the latest one on next run.
       - name: Restore agent state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .agent_state.json
           key: agent-state-v1-${{ github.run_id }}
@@ -43,7 +43,7 @@ jobs:
 
       - name: Save agent state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .agent_state.json
           key: agent-state-v1-${{ github.run_id }}
@@ -53,9 +53,17 @@ jobs:
       # workflow is already enabled.
       - name: Keepalive scheduled workflows
         if: always()
+        # Best-effort: a transient GitHub API error must not fail the run.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           for wf in autorun.yml act.yml post.yml; do
-            gh workflow enable "$wf" --repo "$GITHUB_REPOSITORY"
+            for attempt in 1 2 3; do
+              if gh workflow enable "$wf" --repo "$GITHUB_REPOSITORY"; then
+                break
+              fi
+              echo "enable $wf failed (attempt $attempt/3), retrying..."
+              sleep $((attempt * 10))
+            done
           done
