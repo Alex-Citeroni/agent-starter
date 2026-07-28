@@ -695,6 +695,70 @@ class TestApiNormalization:
         agent.api("GET", "/x")
         assert mock_get.call_count == 3
 
+    @patch("agent.time.sleep")
+    @patch("agent.requests.get")
+    def test_cross_host_redirect_reported_as_config_error(self, mock_get, _sleep):
+        """A 308 to another domain makes `requests` drop the auth header, so
+        the API answers "Invalid or missing API key" and the key looks dead.
+        The error should name the real cause, not the misleading one."""
+        resp = MagicMock()
+        resp.ok = False
+        resp.status_code = 401
+        resp.url = "https://new-host.example/api/v1/agents/me"
+        resp.json.return_value = {
+            "success": False,
+            "error": "Invalid or missing API key",
+        }
+        mock_get.return_value = resp
+        result = agent.api("GET", "/api/v1/agents/me")
+        assert result["success"] is False
+        assert "redirects to https://new-host.example" in result["error"]
+        assert "AGENTS_SOCIETY_URL=https://new-host.example" in result["error"]
+
+
+class TestAuthErrorExitCodes:
+    """A dead key or a wrong host never heals on the next scheduled run.
+    The loop commands must exit non-zero so Actions goes red, instead of
+    reporting success while the agent is entirely offline."""
+
+    @patch("agent.api")
+    def test_heartbeat_exits_on_auth_error(self, mock_api):
+        mock_api.return_value = {
+            "success": False,
+            "status": 401,
+            "error": "Invalid or missing API key",
+        }
+        with pytest.raises(SystemExit) as exc:
+            agent.cmd_heartbeat()
+        assert exc.value.code == 1
+
+    @patch("agent.api")
+    def test_heartbeat_tolerates_transient_error(self, mock_api):
+        mock_api.return_value = {"success": False, "error": "network: timeout"}
+        assert agent.cmd_heartbeat() is None  # no SystemExit
+
+    @patch("agent.fetch_identity")
+    @patch("agent.api")
+    def test_act_exits_on_auth_error(self, mock_api, mock_identity):
+        mock_identity.return_value = {}
+        mock_api.return_value = {
+            "success": False,
+            "status": 401,
+            "error": "Invalid or missing API key",
+        }
+        with pytest.raises(SystemExit) as exc:
+            agent.cmd_act()
+        assert exc.value.code == 1
+
+    def test_is_auth_error_discriminates(self):
+        assert agent.is_auth_error({"success": False, "status": 401})
+        assert agent.is_auth_error(
+            {"success": False, "error": "Invalid or missing API key"}
+        )
+        assert not agent.is_auth_error({"success": False, "error": "network: timeout"})
+        assert not agent.is_auth_error({"success": False, "status": 500})
+        assert not agent.is_auth_error({"success": True})
+
 
 class TestArticleCli:
     @patch("agent.cmd_article")

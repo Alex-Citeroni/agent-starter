@@ -80,6 +80,7 @@ import json
 import time
 import re
 from typing import Optional
+from urllib.parse import urlparse
 import requests
 
 # Optional .env support for local dev
@@ -91,7 +92,10 @@ except ImportError:
     pass
 
 # ── Configuration ──────────────────────────────────────────────
-BASE_URL = os.environ.get("AGENTS_SOCIETY_URL", "https://agentssociety.ai")
+# The platform moved to veii.ai; agentssociety.ai now 308-redirects there.
+# Point at the canonical host directly — `requests` strips the Authorization
+# header across a cross-host redirect, so the old URL authenticates as nobody.
+BASE_URL = os.environ.get("AGENTS_SOCIETY_URL", "https://veii.ai").rstrip("/")
 API_KEY = os.environ.get("AGENTS_SOCIETY_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 # Default to new GitHub Models endpoint; override via LLM_ENDPOINT if needed.
@@ -317,6 +321,30 @@ def api(method: str, path: str, payload: Optional[dict] = None) -> dict:
 
     assert resp is not None  # loop either returned or set resp
 
+    # A cross-host redirect (an old domain 308-ing to a new one) makes
+    # `requests` drop the Authorization header, so the call lands
+    # unauthenticated and the API answers "Invalid or missing API key" —
+    # which reads as a bad key and sends you hunting the wrong bug. We do
+    # NOT re-attach the key to the new host (that's the very leak the strip
+    # prevents): report the real cause and let the user point AGENTS_SOCIETY_URL
+    # at it deliberately.
+    if not resp.ok:
+        # `resp.url` is the *final* URL, so a host change here means we were
+        # redirected. (isinstance-guarded: test doubles don't set a real URL.)
+        final_url = resp.url if isinstance(resp.url, str) else url
+        final = urlparse(final_url)
+        if final.netloc and final.netloc != urlparse(url).netloc:
+            new_base = f"{final.scheme}://{final.netloc}"
+            return {
+                "success": False,
+                "status": resp.status_code,
+                "error": (
+                    f"{BASE_URL} redirects to {new_base}; the auth header is "
+                    f"dropped across hosts, so the request arrived without a key. "
+                    f"Set AGENTS_SOCIETY_URL={new_base}."
+                ),
+            }
+
     try:
         body = resp.json()
     except ValueError:
@@ -337,6 +365,21 @@ def api(method: str, path: str, payload: Optional[dict] = None) -> dict:
 
 def is_rate_limited(data: dict) -> bool:
     return bool(data.get("rate_limited") or data.get("status") == 429)
+
+
+def is_auth_error(data: dict) -> bool:
+    """True when a failed api() dict means "you are not authenticated".
+
+    Unlike a timeout or a 5xx, this never fixes itself on the next
+    scheduled run — the key, or the host it's being sent to, is wrong.
+    Callers use it to exit non-zero so a broken agent shows up red in
+    Actions instead of quietly succeeding forever.
+    """
+    if data.get("success"):
+        return False
+    if data.get("status") in (401, 403):
+        return True
+    return "invalid or missing api key" in str(data.get("error", "")).lower()
 
 
 def format_error(data: dict) -> str:
@@ -974,7 +1017,12 @@ def cmd_article(title: str, body: str, status: str = "published"):
 def cmd_heartbeat():
     data = api("POST", "/api/v1/agents/heartbeat")
     if not data.get("success"):
-        print(f"Heartbeat failed: {data.get('error', data)}")
+        print(f"Heartbeat failed: {format_error(data)}")
+        # A bad key / wrong host won't heal on the next scheduled run, and a
+        # silent return makes every Actions run go green while the agent is
+        # completely offline. Fail loudly; stay tolerant of transient errors.
+        if is_auth_error(data):
+            sys.exit(1)
         return None
     notifs = data["data"].get("notifications", [])
     print(f"Heartbeat OK | Notifications: {len(notifs)}")
@@ -2368,7 +2416,12 @@ def cmd_act():
     """Smart loop: home (notifications + feed) → LLM picks ONE action → execute."""
     identity = fetch_identity()
     if not identity:
-        print("Could not load agent identity.")
+        # fetch_identity() swallows the reason; ask again so the log says
+        # *why* — and so a dead key exits non-zero instead of going green.
+        probe = api("GET", "/api/v1/agents/me")
+        print(f"Could not load agent identity: {format_error(probe)}")
+        if is_auth_error(probe):
+            sys.exit(1)
         return
 
     home = api("GET", "/api/v1/agents/home")

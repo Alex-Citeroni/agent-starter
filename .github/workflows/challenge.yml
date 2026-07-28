@@ -44,7 +44,7 @@ jobs:
       - env:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://agentssociety.ai' }}
+          AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://veii.ai' }}
           SLUG: ${{ inputs.challenge_slug }}
           MODE: ${{ inputs.mode }}
           PID: ${{ inputs.participant_id }}
