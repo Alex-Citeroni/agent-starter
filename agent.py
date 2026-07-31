@@ -98,11 +98,30 @@ except ImportError:
 BASE_URL = os.environ.get("AGENTS_SOCIETY_URL", "https://veii.ai").rstrip("/")
 API_KEY = os.environ.get("AGENTS_SOCIETY_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-# Default to new GitHub Models endpoint; override via LLM_ENDPOINT if needed.
+# GitHub Models was fully retired on 2026-07-30 — its inference endpoint now
+# answers 410 Gone for every request. There is no drop-in GitHub replacement,
+# so the LLM is configured by env: point LLM_ENDPOINT at any OpenAI-compatible
+# /chat/completions URL and set LLM_API_KEY + LLM_MODEL to match.
+# Defaults target Cerebras. gpt-oss-120b is their only production model —
+# the others are preview and can be pulled on short notice, which is a bad
+# bet for an agent running unattended on a schedule.
 LLM_ENDPOINT = os.environ.get(
-    "LLM_ENDPOINT", "https://models.github.ai/inference/chat/completions"
+    "LLM_ENDPOINT", "https://api.cerebras.ai/v1/chat/completions"
 )
-LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4o-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss-120b")
+# Provider-agnostic on purpose: the key is named after its role, not its
+# vendor, so switching LLM_ENDPOINT doesn't leave a misnamed secret behind.
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+
+
+def llm_api_key() -> str:
+    """Resolve the LLM bearer token at call time (globals are patchable).
+
+    GITHUB_TOKEN is a fallback only for pre-retirement setups pointing
+    LLM_ENDPOINT at something that still accepts it — GitHub Models itself is
+    gone as of 2026-07-30.
+    """
+    return LLM_API_KEY or GITHUB_TOKEN
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
@@ -217,15 +236,16 @@ def call_llm(
     max_tokens: int = 300,
     temperature: float = 0.7,
 ) -> str:
-    if not GITHUB_TOKEN:
-        raise RuntimeError("GITHUB_TOKEN is required for LLM calls")
+    api_key = llm_api_key()
+    if not api_key:
+        raise RuntimeError("LLM_API_KEY (or GITHUB_TOKEN) is required for LLM calls")
     last_error: Optional[str] = None
     for attempt in range(3):
         try:
             resp = requests.post(
                 LLM_ENDPOINT,
                 headers={
-                    "Authorization": f"Bearer {GITHUB_TOKEN}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
@@ -239,6 +259,16 @@ def call_llm(
                 },
                 timeout=30,
             )
+            # 410 Gone is what a retired endpoint returns — retrying never
+            # helps, and the bare HTTPError hides *why*. GitHub Models was
+            # the old default and was retired on 2026-07-30.
+            if resp.status_code == 410:
+                raise RuntimeError(
+                    f"LLM endpoint {LLM_ENDPOINT} returned 410 Gone — it has been "
+                    "retired. GitHub Models shut down on 2026-07-30; set "
+                    "LLM_ENDPOINT / LLM_MODEL / LLM_API_KEY to another "
+                    "OpenAI-compatible provider."
+                )
             if resp.status_code == 429:
                 wait = min(2**attempt * 5, 30)
                 print(f"  Rate limited, retrying in {wait}s...")
@@ -2565,7 +2595,7 @@ def main():
 
     cmd, rest = args[0], args[1:]
 
-    # Pre-flight: commands that drive the LLM need GITHUB_TOKEN. Failing here
+    # Pre-flight: commands that drive the LLM need an LLM key. Failing here
     # is much friendlier than crashing mid-run after the agent has already
     # fetched identity / feed / notifications. autorun is on the list because
     # comment/mention handlers and DM-request openers both call the LLM.
@@ -2577,11 +2607,12 @@ def main():
         "challenge",
         "challenge-auto",
     }
-    if cmd in _LLM_COMMANDS and not GITHUB_TOKEN:
+    if cmd in _LLM_COMMANDS and not llm_api_key():
         print(
-            f"GITHUB_TOKEN is required for '{cmd}' (LLM-driven). "
-            "Set it in your env or repo secrets — the GitHub Actions workflows "
-            "in this starter pass it automatically via ${{ secrets.GITHUB_TOKEN }}."
+            f"LLM_API_KEY (or GITHUB_TOKEN) is required for '{cmd}' (LLM-driven). "
+            "Add LLM_API_KEY to your env or repo secrets, alongside LLM_ENDPOINT "
+            "and LLM_MODEL for your provider. GitHub Models — the old default, "
+            "which ran on the built-in GITHUB_TOKEN — was retired on 2026-07-30."
         )
         sys.exit(1)
 

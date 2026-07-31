@@ -208,8 +208,9 @@ To override the strategy for ONE specific challenge, drop a manual
 | `PRODUCT_NAME`        | GestioCarni Pro        | Product for sales challenge                                                                                             |
 | `PRODUCT_DESCRIPTION` | management software... | Product description                                                                                                     |
 | `PRODUCT_PRICE`       | 89 EUR/month...        | Pricing                                                                                                                 |
-| `LLM_MODEL`           | openai/gpt-4o-mini     | GitHub Models model ID                                                                                                  |
-| `LLM_ENDPOINT`        | models.github.ai/...   | Override LLM base URL                                                                                                   |
+| `LLM_API_KEY`         | (unset, **required**)  | API key for your LLM provider. Falls back to `GITHUB_TOKEN` for legacy setups                                            |
+| `LLM_MODEL`           | gpt-oss-120b           | Model ID, as your provider names it                                                                                     |
+| `LLM_ENDPOINT`        | api.cerebras.ai/...    | Any OpenAI-compatible `/chat/completions` URL                                                                            |
 | `CHALLENGE_MAX_TURNS` | 20                     | Cap on challenge conversation turns before force-submit                                                                 |
 | `AGENT_DRY_RUN`       | (unset)                | `1` = log mutating calls but skip them. GETs still fire. Use to preview `act` / `generate` decisions before going live. |
 
@@ -222,9 +223,13 @@ python -m pytest tests/ -v
 
 ## Costs
 
-Everything is free:
-- **GitHub Actions**: 2,000 min/month (private), unlimited (public)
-- **GitHub Models**: GPT-4o-mini via automatic `GITHUB_TOKEN`
+- **GitHub Actions**: free — 2,000 min/month (private), unlimited (public)
+- **LLM inference**: billed by whichever provider you point `LLM_ENDPOINT` at.
+  This used to be free via GitHub Models on the automatic `GITHUB_TOKEN`, but
+  GitHub Models was retired on 2026-07-30 and its endpoint now returns
+  `410 Gone`. Set `LLM_API_KEY` (repo secret) plus `LLM_ENDPOINT` / `LLM_MODEL`
+  (repo variables) to any OpenAI-compatible provider. Defaults point at
+  Cerebras (`gpt-oss-120b`, their production model).
 
 ## Upgrade notes (breaking changes from earlier starters)
 

@@ -37,7 +37,9 @@ jobs:
 
       - env:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_ENDPOINT: ${{ vars.LLM_ENDPOINT || 'https://api.cerebras.ai/v1/chat/completions' }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'gpt-oss-120b' }}
           AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://veii.ai' }}
         run: python agent.py generate ${{ inputs.topic }}
 
