@@ -274,6 +274,75 @@ class TestCallLLM:
             agent.GITHUB_TOKEN = original
 
 
+class TestReasoningModels:
+    """Reasoning models spend tokens thinking before they emit any text.
+
+    Sized for a plain chat model, the caller's max_tokens is consumed by the
+    reasoning pass and the reply comes back with no `content` key at all —
+    which used to surface as a bare KeyError deep in call_llm.
+    """
+
+    @patch("agent.requests.post")
+    def test_reasoning_model_gets_headroom_and_effort(self, mock_post):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        resp.raise_for_status = MagicMock()
+        mock_post.return_value = resp
+
+        with patch.object(agent, "LLM_MODEL", "gpt-oss-120b"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}], max_tokens=200)
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["max_tokens"] == 200 * agent.REASONING_TOKEN_HEADROOM
+        assert body["reasoning_effort"] == agent.LLM_REASONING_EFFORT
+
+    @patch("agent.requests.post")
+    def test_plain_model_keeps_budget_and_omits_effort(self, mock_post):
+        """reasoning_effort is an unknown param to non-reasoning providers,
+        which reject it with a 400 — so it must not be sent unconditionally."""
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        resp.raise_for_status = MagicMock()
+        mock_post.return_value = resp
+
+        with patch.object(agent, "LLM_MODEL", "gpt-4o-mini"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}], max_tokens=200)
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["max_tokens"] == 200
+        assert "reasoning_effort" not in body
+
+    def test_budget_exhausted_by_reasoning_explains_itself(self):
+        payload = {
+            "choices": [{"message": {"reasoning": "..."}, "finish_reason": "length"}]
+        }
+        with pytest.raises(RuntimeError, match="token limit"):
+            agent._extract_message_content(payload)
+
+    def test_reasoning_content_is_accepted_as_the_answer(self):
+        payload = {"choices": [{"message": {"reasoning_content": "the answer"}}]}
+        assert agent._extract_message_content(payload) == "the answer"
+
+    def test_provider_error_surfaces_its_message(self):
+        with pytest.raises(RuntimeError, match="bad model"):
+            agent._extract_message_content({"error": {"message": "bad model"}})
+
+    def test_empty_content_is_not_a_keyerror(self):
+        payload = {"choices": [{"message": {"content": "  "}, "finish_reason": "stop"}]}
+        with pytest.raises(RuntimeError, match="empty message"):
+            agent._extract_message_content(payload)
+
+
+class TestRetiredEndpoint:
+    @patch("agent.requests.post")
+    def test_410_fails_fast_with_migration_hint(self, mock_post):
+        """410 means retired — retrying burns the whole budget for nothing."""
+        mock_post.return_value = MagicMock(status_code=410)
+        with pytest.raises(RuntimeError, match="410 Gone"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+        assert mock_post.call_count == 1
+
+
 # ── CLI dispatch ───────────────────────────────────────────────
 
 

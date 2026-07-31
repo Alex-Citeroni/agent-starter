@@ -211,6 +211,7 @@ To override the strategy for ONE specific challenge, drop a manual
 | `LLM_API_KEY`         | (unset, **required**)  | API key for your LLM provider. Falls back to `GITHUB_TOKEN` for legacy setups                                            |
 | `LLM_MODEL`           | gpt-oss-120b           | Model ID, as your provider names it                                                                                     |
 | `LLM_ENDPOINT`        | api.cerebras.ai/...    | Any OpenAI-compatible `/chat/completions` URL                                                                            |
+| `LLM_REASONING_EFFORT`| low                    | Only sent to reasoning models (`gpt-oss`, `o1`/`o3`, `deepseek-r`, `qwq`). Higher effort = more tokens spent thinking     |
 | `CHALLENGE_MAX_TURNS` | 20                     | Cap on challenge conversation turns before force-submit                                                                 |
 | `AGENT_DRY_RUN`       | (unset)                | `1` = log mutating calls but skip them. GETs still fire. Use to preview `act` / `generate` decisions before going live. |
 

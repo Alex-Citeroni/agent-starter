@@ -113,6 +113,21 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss-120b")
 # vendor, so switching LLM_ENDPOINT doesn't leave a misnamed secret behind.
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 
+# Reasoning models emit internal reasoning tokens *before* the visible answer,
+# and those tokens count against max_tokens. Every call site here sizes
+# max_tokens for the post it wants (200-300) — sized for a plain chat model,
+# that budget is spent reasoning and the reply comes back with no `content`
+# at all. So: ask for the cheapest reasoning effort, and give the reasoning
+# its own headroom on top of the caller's budget instead of stealing from it.
+REASONING_MODEL_MARKERS = ("gpt-oss", "o1", "o3", "deepseek-r", "qwq")
+LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
+REASONING_TOKEN_HEADROOM = 4
+
+
+def is_reasoning_model(model: str = "") -> bool:
+    name = (model or LLM_MODEL).lower()
+    return any(marker in name for marker in REASONING_MODEL_MARKERS)
+
 
 def llm_api_key() -> str:
     """Resolve the LLM bearer token at call time (globals are patchable).
@@ -230,6 +245,46 @@ def recent_own_posts() -> list[str]:
 # ── LLM ────────────────────────────────────────────────────────
 
 
+def _extract_message_content(payload: dict) -> str:
+    """Pull the assistant text out of an OpenAI-shaped completion.
+
+    Indexing straight into ["choices"][0]["message"]["content"] raises a bare
+    KeyError that says nothing about what actually went wrong. The two real
+    failure modes both surface here: a reasoning model that spent its whole
+    budget thinking (no `content`, finish_reason "length"), and a provider
+    that returns the text under `reasoning_content` instead.
+    """
+    choices = payload.get("choices") or []
+    if not choices:
+        err = payload.get("error")
+        detail = err.get("message") if isinstance(err, dict) else err
+        raise RuntimeError(f"LLM returned no choices ({detail or payload})")
+
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
+    content = message.get("content")
+
+    # Some providers put the visible answer under a reasoning-specific key.
+    if not content:
+        content = message.get("reasoning_content") or ""
+
+    if not isinstance(content, str) or not content.strip():
+        finish = choice.get("finish_reason")
+        if finish == "length":
+            raise RuntimeError(
+                f"LLM hit the token limit before producing any text "
+                f"(model={LLM_MODEL}, finish_reason=length). "
+                "This is typical of a reasoning model whose budget was spent "
+                "thinking — lower LLM_REASONING_EFFORT or raise "
+                "REASONING_TOKEN_HEADROOM."
+            )
+        raise RuntimeError(
+            f"LLM returned an empty message (model={LLM_MODEL}, "
+            f"finish_reason={finish}, keys={sorted(message)})"
+        )
+    return content.strip()
+
+
 def call_llm(
     system_prompt: str,
     messages: list[dict],
@@ -239,6 +294,20 @@ def call_llm(
     api_key = llm_api_key()
     if not api_key:
         raise RuntimeError("LLM_API_KEY (or GITHUB_TOKEN) is required for LLM calls")
+    body = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            *messages,
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if is_reasoning_model():
+        body["max_tokens"] = max_tokens * REASONING_TOKEN_HEADROOM
+        if LLM_REASONING_EFFORT:
+            body["reasoning_effort"] = LLM_REASONING_EFFORT
+
     last_error: Optional[str] = None
     for attempt in range(3):
         try:
@@ -248,15 +317,7 @@ def call_llm(
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": LLM_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        *messages,
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
+                json=body,
                 timeout=30,
             )
             # 410 Gone is what a retired endpoint returns — retrying never
@@ -284,7 +345,7 @@ def call_llm(
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            return _extract_message_content(resp.json())
         except requests.exceptions.Timeout:
             last_error = "timeout"
             time.sleep(3)
