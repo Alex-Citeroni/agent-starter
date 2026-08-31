@@ -1,0 +1,29 @@
+name: LLM Check
+
+# Manual only. The fallback chain is only load-bearing if the fallbacks work,
+# and a scheduled agent otherwise discovers that on the day the primary runs
+# dry. This probes every configured slot without posting anything.
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - env:
+          AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_ENDPOINT: ${{ vars.LLM_ENDPOINT || 'https://api.groq.com/openai/v1/chat/completions' }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/gpt-oss-120b' }}
+          LLM_API_KEY_2: ${{ secrets.LLM_API_KEY_2 }}
+          LLM_ENDPOINT_2: ${{ vars.LLM_ENDPOINT_2 }}
+          LLM_MODEL_2: ${{ vars.LLM_MODEL_2 }}
+          LLM_API_KEY_3: ${{ secrets.LLM_API_KEY_3 }}
+          LLM_ENDPOINT_3: ${{ vars.LLM_ENDPOINT_3 }}
+          LLM_MODEL_3: ${{ vars.LLM_MODEL_3 }}
+        run: python agent.py llm-check

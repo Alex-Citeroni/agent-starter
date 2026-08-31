@@ -724,6 +724,130 @@ class TestApiRecordsStatus:
         assert agent.is_retryable_failure(data) is False
 
 
+
+class TestActClearsAnsweredNotifications:
+    """act sees only UNREAD notifications and used to never clear them, leaning
+    on autorun (every 15 min) to do it first. With autorun off, the same
+    comment got answered every couple of hours until the platform's per-post
+    spam guard refused it.
+    """
+
+    @staticmethod
+    def _home(notif_extra=None):
+        notif = {
+            "id": "n1",
+            "type": "comment",
+            "post_id": "p1",
+            "comment_id": "c9",
+            "comment_preview": "why?",
+            "actor": {"username": "other"},
+        }
+        notif.update(notif_extra or {})
+        return {
+            "success": True,
+            "data": {"notifications": [notif], "feed": {"posts": []}},
+        }
+
+    @patch("agent._mark_notification_read")
+    @patch("agent.cmd_comment")
+    @patch("agent.call_llm")
+    @patch("agent.api")
+    @patch("agent.fetch_identity")
+    def test_answered_notification_is_marked_read(
+        self, mock_identity, mock_api, mock_llm, mock_comment, mock_read
+    ):
+        mock_identity.return_value = {"username": "bot"}
+        mock_api.return_value = self._home()
+        mock_comment.return_value = {"success": True, "data": {"comment_id": "x"}}
+        mock_llm.return_value = (
+            '{"action": "comment", "target_id": "p1", "parent_id": "c9",'
+            ' "text": "because X", "reason": "answering"}'
+        )
+
+        agent.cmd_act()
+
+        mock_read.assert_called_once_with("n1")
+
+    @patch("agent._mark_notification_read")
+    @patch("agent.cmd_comment")
+    @patch("agent.call_llm")
+    @patch("agent.api")
+    @patch("agent.fetch_identity")
+    def test_retryable_failure_keeps_it_unread(
+        self, mock_identity, mock_api, mock_llm, mock_comment, mock_read
+    ):
+        mock_identity.return_value = {"username": "bot"}
+        mock_api.return_value = self._home()
+        mock_comment.return_value = {
+            "success": False, "status": 429, "retry_after_seconds": 3600,
+        }
+        mock_llm.return_value = (
+            '{"action": "comment", "target_id": "p1", "parent_id": "c9",'
+            ' "text": "because X", "reason": "answering"}'
+        )
+
+        agent.cmd_act()
+
+        mock_read.assert_not_called()
+
+    @patch("agent._mark_notification_read")
+    @patch("agent.cmd_post")
+    @patch("agent.call_llm")
+    @patch("agent.api")
+    @patch("agent.fetch_identity")
+    def test_unrelated_action_clears_nothing(
+        self, mock_identity, mock_api, mock_llm, _mock_post, mock_read
+    ):
+        """A cold post answers no notification — clearing one would silence a
+        conversation nobody replied to."""
+        mock_identity.return_value = {"username": "bot"}
+        mock_api.return_value = self._home()
+        mock_llm.return_value = (
+            '{"action": "post", "text": "unrelated thought", "reason": "idea"}'
+        )
+
+        agent.cmd_act()
+
+        mock_read.assert_not_called()
+
+    def test_decision_without_ids_matches_no_notification(self):
+        notifs = [{"id": "n1", "post_id": "p1", "comment_id": "c9"}]
+        assert agent._notification_for(notifs, {"action": "post"}) is None
+
+
+class TestLlmCheck:
+    """The fallback chain is only load-bearing if the fallbacks answer."""
+
+    @patch("agent.requests.post")
+    def test_every_slot_is_probed_independently(self, mock_post, monkeypatch):
+        """A dead slot 1 must not hide slot 2, and must not mark it dead."""
+        monkeypatch.setenv("LLM_ENDPOINT_2", "https://backup.example/v1")
+        monkeypatch.setenv("LLM_MODEL_2", "backup-model")
+        monkeypatch.setenv("LLM_API_KEY_2", "k2")
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_post.side_effect = [MagicMock(status_code=402, text="no credit"), ok]
+
+        agent.cmd_llm_check()
+
+        assert mock_post.call_count == 2
+        assert mock_post.call_args_list[1].args[0] == "https://backup.example/v1"
+
+    @patch("agent.requests.post")
+    def test_exits_non_zero_when_nothing_answers(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=402, text="no credit")
+        with pytest.raises(SystemExit) as exc:
+            agent.cmd_llm_check()
+        assert exc.value.code == 1
+
+    @patch("agent.requests.post")
+    def test_a_working_chain_does_not_exit(self, mock_post):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_post.return_value = resp
+        agent.cmd_llm_check()  # must not raise SystemExit
+
+
 # ── CLI dispatch ───────────────────────────────────────────────
 
 

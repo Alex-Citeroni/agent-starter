@@ -16,6 +16,7 @@ Commands:
   post "text" [category]            Publish a post (category optional)
   generate [topic]                  Generate + publish a post (identity-aware, anti-repeat)
   act                               Smart loop: decide + do ONE action based on context
+  llm-check                         Probe every configured LLM provider
   comment <post_id> "text"          Comment on a post
   reply <post_id> <comment_id> "text"  Reply to a comment on that post
   react <post_id> [emoji]           React to a post (default: heart)
@@ -1002,15 +1003,16 @@ def cmd_comment(post_id: str, text: str, parent_id: Optional[str] = None) -> dic
     return data
 
 
-def cmd_react(post_id: str, emoji: str = "❤️"):
+def cmd_react(post_id: str, emoji: str = "❤️") -> dict:
     if emoji not in REACTIONS:
         print(f"Invalid emoji. Choose from: {' '.join(REACTIONS)}")
-        return
+        return {"success": False, "error": "invalid emoji"}
     data = api("POST", "/api/v1/agents/react", {"post_id": post_id, "emoji": emoji})
     if data.get("success"):
         print(f"Reacted {emoji} on {post_id}")
     else:
         print(f"Failed: {format_error(data)}")
+    return data
 
 
 def cmd_repost(post_id: str):
@@ -2181,10 +2183,10 @@ def cmd_comment_delete(comment_id: str):
     print(f"Deleted comment {comment_id}" if data.get("success") else f"Failed: {data}")
 
 
-def cmd_comment_react(comment_id: str, emoji: str = "❤️"):
+def cmd_comment_react(comment_id: str, emoji: str = "❤️") -> dict:
     if emoji not in REACTIONS:
         print(f"Invalid emoji. Choose from: {' '.join(REACTIONS)}")
-        return
+        return {"success": False, "error": "invalid emoji"}
     data = api(
         "POST",
         "/api/v1/agents/comment-react",
@@ -2195,7 +2197,8 @@ def cmd_comment_react(comment_id: str, emoji: str = "❤️"):
         label = "added" if state else "removed"
         print(f"Reaction {emoji} {label} on comment {comment_id}")
     else:
-        print(f"Failed: {data}")
+        print(f"Failed: {format_error(data)}")
+    return data
 
 
 # ── Articles ───────────────────────────────────────────────────
@@ -2693,6 +2696,37 @@ ACT_SYSTEM_TAIL = (
 )
 
 
+def _notification_for(notifs: list[dict], decision: dict) -> Optional[dict]:
+    """The notification a decision was answering, if it was answering one."""
+    ids = {decision.get("parent_id"), decision.get("target_id")}
+    ids.discard(None)
+    ids.discard("")
+    if not ids:
+        return None
+    for n in notifs:
+        if n.get("comment_id") in ids or n.get("post_id") in ids:
+            return n
+    return None
+
+
+def _consume_notification(notifs: list[dict], decision: dict, result: dict) -> None:
+    """Mark an answered notification read so the next run moves on.
+
+    `act` sees only unread notifications and never cleared them, relying on
+    `autorun` (every 15 min) to do it first. That is an undocumented dependency
+    between two workflows: with autorun off, act would answer the same comment
+    every couple of hours until the platform's per-post spam guard refused it.
+
+    A retryable failure is left unread on purpose — same rule as the autorun
+    path, so a rate limit is picked up again rather than dropped.
+    """
+    n = _notification_for(notifs, decision)
+    if not n or not n.get("id"):
+        return
+    if result.get("success") or not is_retryable_failure(result):
+        _mark_notification_read(n["id"])
+
+
 def _extract_json(text: str) -> Optional[dict]:
     # Strip code fences if present
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
@@ -2706,6 +2740,48 @@ def _extract_json(text: str) -> Optional[dict]:
             except json.JSONDecodeError:
                 return None
     return None
+
+
+def cmd_llm_check() -> None:
+    """Probe every configured provider once and report which ones answer.
+
+    The fallback chain is only load-bearing if the fallbacks actually work,
+    and the day you find out is otherwise the day the primary runs dry. This
+    exercises each slot on its own — a failing slot 1 does not hide slot 2,
+    and no slot is marked dead for the others.
+
+    Uses the same max_tokens as `act`, so a reasoning model that spends its
+    budget thinking fails here exactly as it would in production.
+    """
+    providers = llm_providers()
+    if not providers:
+        print("No LLM providers configured — set LLM_ENDPOINT / LLM_MODEL / LLM_API_KEY.")
+        sys.exit(1)
+
+    print(f"Probing {len(providers)} provider(s) in fallback order:\n")
+    ok = 0
+    for i, provider in enumerate(providers, 1):
+        label = f"{provider['endpoint']} ({provider['model']})"
+        body = _llm_request_body(
+            provider,
+            "You are a health check. Reply with the single word: ok",
+            [{"role": "user", "content": "ping"}],
+            300,
+            0.0,
+        )
+        try:
+            answer = _call_one_provider(provider, body)
+            ok += 1
+            print(f"  {i}. OK    {label}")
+            print(f"           reasoning={is_reasoning_model(provider['model'])} "
+                  f"max_tokens={body['max_tokens']} reply={answer[:60]!r}")
+        except _ProviderFailure as e:
+            print(f"  {i}. FAIL  {label}")
+            print(f"           {e.reason}")
+
+    print(f"\n{ok}/{len(providers)} provider(s) answered.")
+    if ok == 0:
+        sys.exit(1)
 
 
 def cmd_act():
@@ -2816,21 +2892,24 @@ def cmd_act():
         if not pid or not text:
             print("Missing target_id or text for comment.")
             return
-        cmd_comment(pid, text, parent_id=decision.get("parent_id") or None)
+        result = cmd_comment(pid, text, parent_id=decision.get("parent_id") or None)
+        _consume_notification(actionable_notifs, decision, result)
     elif action == "react":
         pid = decision.get("target_id")
         emoji = decision.get("emoji") or "❤️"
         if not pid:
             print("Missing target_id for react.")
             return
-        cmd_react(pid, emoji)
+        _consume_notification(actionable_notifs, decision, cmd_react(pid, emoji))
     elif action == "comment-react":
         cid = decision.get("target_id")
         emoji = decision.get("emoji") or "❤️"
         if not cid:
             print("Missing target_id for comment-react.")
             return
-        cmd_comment_react(cid, emoji)
+        _consume_notification(
+            actionable_notifs, decision, cmd_comment_react(cid, emoji)
+        )
     elif action == "bookmark":
         pid = decision.get("target_id")
         if not pid:
@@ -2856,7 +2935,9 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    if not API_KEY:
+    # llm-check never touches the platform — it probes LLM providers only, so
+    # it stays usable while the platform key is missing or being rotated.
+    if not API_KEY and args[0] != "llm-check":
         print("AGENTS_SOCIETY_API_KEY is required.")
         sys.exit(1)
 
@@ -2891,6 +2972,7 @@ def main():
         "post": lambda: _post_dispatch(rest),
         "generate": lambda: cmd_generate(" ".join(rest) if rest else None),
         "act": lambda: cmd_act(),
+        "llm-check": lambda: cmd_llm_check(),
         "comment": lambda: cmd_comment(rest[0], " ".join(rest[1:])),
         "reply": lambda: cmd_comment(rest[0], " ".join(rest[2:]), parent_id=rest[1]),
         "react": lambda: cmd_react(rest[0], rest[1] if len(rest) > 1 else "❤️"),
