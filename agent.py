@@ -17,6 +17,7 @@ Commands:
   generate [topic]                  Generate + publish a post (identity-aware, anti-repeat)
   act                               Smart loop: decide + do ONE action based on context
   comment <post_id> "text"          Comment on a post
+  reply <post_id> <comment_id> "text"  Reply to a comment on that post
   react <post_id> [emoji]           React to a post (default: heart)
   repost <post_id>                  Repost a post
   follow <username>                 Follow a user
@@ -953,15 +954,25 @@ def cmd_generate(topic: Optional[str] = None):
     cmd_post(text, category=category)
 
 
-def cmd_comment(post_id: str, text: str):
-    data = api(
-        "POST", "/api/v1/agents/comment", {"post_id": post_id, "text": text.strip()}
-    )
+def cmd_comment(post_id: str, text: str, parent_id: Optional[str] = None) -> bool:
+    """Comment on a post, or reply to a comment on it when parent_id is given.
+
+    The platform rejects a *top-level* comment on your own post ("reads as
+    talking to yourself") but allows replying to someone else's comment on it —
+    that's a conversation, not an echo. parent_id is what separates the two, so
+    every reply-to-a-notification path must pass it.
+    """
+    payload = {"post_id": post_id, "text": text.strip()}
+    if parent_id:
+        payload["parent_id"] = parent_id
+    data = api("POST", "/api/v1/agents/comment", payload)
     if data.get("success"):
         cid = (data.get("data") or {}).get("comment_id", "ok")
-        print(f"Commented on {post_id} (comment_id={cid})")
-    else:
-        print(f"Failed: {format_error(data)}")
+        where = f"{post_id} (reply to {parent_id})" if parent_id else post_id
+        print(f"Commented on {where} (comment_id={cid})")
+        return True
+    print(f"Failed: {format_error(data)}")
+    return False
 
 
 def cmd_react(post_id: str, emoji: str = "❤️"):
@@ -1356,8 +1367,17 @@ def _handle_engagement_notification(notif: dict, identity: dict) -> None:
         return
     if not reply:
         return
-    print(f"\nReplying to @{actor}'s {ntype} on {post_id}: {reply[:80]}")
-    cmd_comment(post_id, reply)
+    # The notification carries the id of the comment that triggered it. Using
+    # it as parent_id is what makes this a reply rather than a top-level
+    # comment on our own post — which the platform refuses.
+    parent_id = notif.get("comment_id")
+    target = f"comment {parent_id}" if parent_id else f"post {post_id}"
+    print(f"\nReplying to @{actor}'s {ntype} on {target}: {reply[:80]}")
+    if not cmd_comment(post_id, reply, parent_id=parent_id):
+        # Leave it unread: a burnt notification is a conversation dropped in
+        # silence, and the run still reports itself as having handled it.
+        print("  Reply rejected — leaving the notification unread to retry.")
+        return
     _mark_notification_read(notif["id"])
 
 
@@ -2617,6 +2637,7 @@ ACT_SYSTEM_TAIL = (
     "Return ONLY valid JSON with this shape:\n"
     '{"action": "post|comment|react|follow|comment-react|bookmark|skip", '
     '"target_id": "<post_id or comment_id depending on action>", '
+    '"parent_id": "<comment_id to reply to, only for action=comment>", '
     '"username": "<username for follow>", '
     '"text": "<post or comment text>", '
     '"category": "<post category, only for action=post>", '
@@ -2624,12 +2645,17 @@ ACT_SYSTEM_TAIL = (
     '"reason": "<short why>"}\n'
     "Action semantics:\n"
     "  post         — cold-post to the feed (use a category from the list)\n"
-    "  comment      — reply to a specific post (target_id=post_id)\n"
+    "  comment      — comment on a post (target_id=post_id), or reply to a\n"
+    "                 comment by also setting parent_id=comment_id\n"
     "  react        — emoji reaction on a post (target_id=post_id)\n"
     "  comment-react — emoji reaction on a comment (target_id=comment_id)\n"
     "  follow       — follow an interesting user (username)\n"
     "  bookmark     — save a post for later (target_id=post_id)\n"
     "  skip         — nothing worth doing right now\n"
+    "A notification about a comment on YOUR post is answered with "
+    "action=comment, target_id=that post_id AND parent_id=that comment_id — a "
+    "top-level comment on your own post is rejected, a reply to someone else's "
+    "comment on it is not. Never set parent_id to a comment you wrote.\n"
     "Prefer 'skip' over low-signal actions. Never repeat your own recent posts. "
     "Comments must add genuine value — no empty praise."
 )
@@ -2693,7 +2719,8 @@ def cmd_act():
     notif_block = (
         "\n".join(
             f"[{n.get('type')}] @{(n.get('actor') or {}).get('username', '?')} "
-            f"on post={n.get('post_id', '-')}: "
+            f"on post={n.get('post_id') or '-'} "
+            f"comment={n.get('comment_id') or '-'}: "
             f"{sanitize_external_text(n.get('comment_preview') or '', limit=160)}"
             for n in actionable_notifs
         )
@@ -2757,7 +2784,7 @@ def cmd_act():
         if not pid or not text:
             print("Missing target_id or text for comment.")
             return
-        cmd_comment(pid, text)
+        cmd_comment(pid, text, parent_id=decision.get("parent_id") or None)
     elif action == "react":
         pid = decision.get("target_id")
         emoji = decision.get("emoji") or "❤️"
@@ -2833,6 +2860,7 @@ def main():
         "generate": lambda: cmd_generate(" ".join(rest) if rest else None),
         "act": lambda: cmd_act(),
         "comment": lambda: cmd_comment(rest[0], " ".join(rest[1:])),
+        "reply": lambda: cmd_comment(rest[0], " ".join(rest[2:]), parent_id=rest[1]),
         "react": lambda: cmd_react(rest[0], rest[1] if len(rest) > 1 else "❤️"),
         "repost": lambda: cmd_repost(rest[0]),
         "follow": lambda: cmd_follow(rest[0]),

@@ -495,6 +495,150 @@ class TestProviderFallbackChain:
         assert mock_post.call_count == 1
 
 
+
+class TestReplyToComments:
+    """The platform refuses a top-level comment on your own post but allows
+    replying to someone else's comment on it. parent_id is the whole
+    difference, and the notification already carries the comment id.
+    """
+
+    @patch("agent.api")
+    def test_parent_id_is_sent_when_replying(self, mock_api):
+        mock_api.return_value = {"success": True, "data": {"comment_id": "new"}}
+
+        assert agent.cmd_comment("p1", "thanks", parent_id="c9") is True
+
+        payload = mock_api.call_args.args[2]
+        assert payload["post_id"] == "p1"
+        assert payload["parent_id"] == "c9"
+
+    @patch("agent.api")
+    def test_plain_comment_omits_parent_id(self, mock_api):
+        """Sending parent_id=None would make the payload claim a reply to
+        nothing; the field must be absent for a top-level comment."""
+        mock_api.return_value = {"success": True, "data": {"comment_id": "new"}}
+
+        agent.cmd_comment("p1", "hello")
+
+        assert "parent_id" not in mock_api.call_args.args[2]
+
+    @patch("agent.api")
+    def test_rejected_comment_reports_failure(self, mock_api):
+        mock_api.return_value = {"success": False, "error": "This is your own post"}
+        assert agent.cmd_comment("p1", "hello") is False
+
+    @patch("agent._mark_notification_read")
+    @patch("agent.cmd_comment")
+    @patch("agent.call_llm")
+    def test_engagement_reply_uses_the_notification_comment_id(
+        self, mock_llm, mock_comment, mock_read
+    ):
+        mock_llm.return_value = "good question — here is why"
+        mock_comment.return_value = True
+        notif = {
+            "id": "n1",
+            "type": "comment",
+            "post_id": "p1",
+            "comment_id": "c9",
+            "comment_preview": "why does that work?",
+            "actor": {"username": "other"},
+        }
+
+        agent._handle_engagement_notification(notif, {"username": "bot"})
+
+        assert mock_comment.call_args.kwargs["parent_id"] == "c9"
+        mock_read.assert_called_once_with("n1")
+
+    @patch("agent._mark_notification_read")
+    @patch("agent.cmd_comment")
+    @patch("agent.call_llm")
+    def test_failed_reply_leaves_the_notification_unread(
+        self, mock_llm, mock_comment, mock_read
+    ):
+        """Marking it read on failure drops the conversation in silence and
+        still counts the notification as handled."""
+        mock_llm.return_value = "a reply"
+        mock_comment.return_value = False
+        notif = {
+            "id": "n1",
+            "type": "comment",
+            "post_id": "p1",
+            "comment_id": "c9",
+            "comment_preview": "why does that work?",
+            "actor": {"username": "other"},
+        }
+
+        agent._handle_engagement_notification(notif, {"username": "bot"})
+
+        mock_read.assert_not_called()
+
+    @patch("agent.cmd_comment")
+    @patch("agent.call_llm")
+    @patch("agent.api")
+    @patch("agent.fetch_identity")
+    def test_act_passes_parent_id_through(
+        self, mock_identity, mock_api, mock_llm, mock_comment
+    ):
+        mock_identity.return_value = {"username": "bot"}
+        mock_api.return_value = {
+            "success": True,
+            "data": {
+                "notifications": [
+                    {
+                        "id": "n1",
+                        "type": "comment",
+                        "post_id": "p1",
+                        "comment_id": "c9",
+                        "comment_preview": "why?",
+                        "actor": {"username": "other"},
+                    }
+                ],
+                "feed": {"posts": []},
+            },
+        }
+        mock_llm.return_value = (
+            '{"action": "comment", "target_id": "p1", "parent_id": "c9",'
+            ' "text": "because X", "reason": "answering a question"}'
+        )
+
+        agent.cmd_act()
+
+        mock_comment.assert_called_once_with("p1", "because X", parent_id="c9")
+
+    @patch("agent.cmd_comment")
+    @patch("agent.call_llm")
+    @patch("agent.api")
+    @patch("agent.fetch_identity")
+    def test_act_offers_the_comment_id_to_the_model(
+        self, mock_identity, mock_api, mock_llm, _mock_comment
+    ):
+        """Without the comment id in the prompt the model has no parent to
+        point at, and the only id it can reach is its own post."""
+        mock_identity.return_value = {"username": "bot"}
+        mock_api.return_value = {
+            "success": True,
+            "data": {
+                "notifications": [
+                    {
+                        "id": "n1",
+                        "type": "comment",
+                        "post_id": "p1",
+                        "comment_id": "c9",
+                        "comment_preview": "why?",
+                        "actor": {"username": "other"},
+                    }
+                ],
+                "feed": {"posts": []},
+            },
+        }
+        mock_llm.return_value = '{"action": "skip", "reason": "nothing"}'
+
+        agent.cmd_act()
+
+        prompt = mock_llm.call_args.args[1][0]["content"]
+        assert "comment=c9" in prompt
+
+
 # ── CLI dispatch ───────────────────────────────────────────────
 
 
