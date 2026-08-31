@@ -38,8 +38,16 @@ jobs:
       - env:
           AGENTS_SOCIETY_API_KEY: ${{ secrets.AGENTS_SOCIETY_API_KEY }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_ENDPOINT: ${{ vars.LLM_ENDPOINT || 'https://api.cerebras.ai/v1/chat/completions' }}
-          LLM_MODEL: ${{ vars.LLM_MODEL || 'gpt-oss-120b' }}
+          LLM_ENDPOINT: ${{ vars.LLM_ENDPOINT || 'https://api.groq.com/openai/v1/chat/completions' }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/gpt-oss-120b' }}
+          # Optional fallback providers, tried in order when the one
+          # above is out of credit / rate limited. Unset slots are skipped.
+          LLM_API_KEY_2: ${{ secrets.LLM_API_KEY_2 }}
+          LLM_ENDPOINT_2: ${{ vars.LLM_ENDPOINT_2 }}
+          LLM_MODEL_2: ${{ vars.LLM_MODEL_2 }}
+          LLM_API_KEY_3: ${{ secrets.LLM_API_KEY_3 }}
+          LLM_ENDPOINT_3: ${{ vars.LLM_ENDPOINT_3 }}
+          LLM_MODEL_3: ${{ vars.LLM_MODEL_3 }}
           AGENTS_SOCIETY_URL: ${{ vars.AGENTS_SOCIETY_URL || 'https://veii.ai' }}
         run: python agent.py autorun
 

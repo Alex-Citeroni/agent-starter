@@ -209,8 +209,9 @@ To override the strategy for ONE specific challenge, drop a manual
 | `PRODUCT_DESCRIPTION` | management software... | Product description                                                                                                     |
 | `PRODUCT_PRICE`       | 89 EUR/month...        | Pricing                                                                                                                 |
 | `LLM_API_KEY`         | (unset, **required**)  | API key for your LLM provider. Falls back to `GITHUB_TOKEN` for legacy setups                                            |
-| `LLM_MODEL`           | gpt-oss-120b           | Model ID, as your provider names it                                                                                     |
-| `LLM_ENDPOINT`        | api.cerebras.ai/...    | Any OpenAI-compatible `/chat/completions` URL                                                                            |
+| `LLM_MODEL`           | openai/gpt-oss-120b    | Model ID, as your provider names it                                                                                     |
+| `LLM_ENDPOINT`        | api.groq.com/...       | Any OpenAI-compatible `/chat/completions` URL                                                                            |
+| `LLM_*_2` … `LLM_*_4` | (unset)                | Fallback providers. Set `LLM_ENDPOINT_2` + `LLM_MODEL_2` + `LLM_API_KEY_2` to try a second provider when the first fails |
 | `LLM_REASONING_EFFORT`| low                    | Only sent to reasoning models (`gpt-oss`, `o1`/`o3`, `deepseek-r`, `qwq`). Higher effort = more tokens spent thinking     |
 | `CHALLENGE_MAX_TURNS` | 20                     | Cap on challenge conversation turns before force-submit                                                                 |
 | `AGENT_DRY_RUN`       | (unset)                | `1` = log mutating calls but skip them. GETs still fire. Use to preview `act` / `generate` decisions before going live. |
@@ -229,8 +230,43 @@ python -m pytest tests/ -v
   This used to be free via GitHub Models on the automatic `GITHUB_TOKEN`, but
   GitHub Models was retired on 2026-07-30 and its endpoint now returns
   `410 Gone`. Set `LLM_API_KEY` (repo secret) plus `LLM_ENDPOINT` / `LLM_MODEL`
-  (repo variables) to any OpenAI-compatible provider. Defaults point at
-  Cerebras (`gpt-oss-120b`, their production model).
+  (repo variables) to any OpenAI-compatible provider. Defaults point at Groq
+  (`openai/gpt-oss-120b`).
+- **Pick a provider whose free tier renews.** The defaults were Cerebras until
+  2026-08-31, which grants a one-time $5 credit rather than a recurring
+  allowance — an agent on a schedule spends it and then every run dies on
+  `402 Payment Required`. Groq's free tier renews against daily rate limits,
+  which is the shape unattended cron runs need. Confirm the current limits on
+  your provider's console before raising the schedule frequency.
+- A `402 Payment Required` from the LLM endpoint means that provider account is
+  out of credit (free-tier quota spent, or billing never set up) — top it up,
+  or repoint `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` at another provider.
+
+### Fallback providers
+
+One provider is a single point of failure. Configure a chain and `call_llm`
+walks it in order, moving on when a link is out of credit, rate limited, or
+rejects the request:
+
+```
+LLM_ENDPOINT   / LLM_MODEL   / LLM_API_KEY     # primary
+LLM_ENDPOINT_2 / LLM_MODEL_2 / LLM_API_KEY_2   # first fallback
+LLM_ENDPOINT_3 / LLM_MODEL_3 / LLM_API_KEY_3   # second fallback
+```
+
+Endpoints and model IDs are public — put them in repo **variables**. Keys go in
+repo **secrets**. A slot missing any of its three fields is skipped, so a
+half-configured fallback can't break a run.
+
+```bash
+gh secret set LLM_API_KEY_2
+gh variable set LLM_ENDPOINT_2 --body "https://api.cerebras.ai/v1/chat/completions"
+gh variable set LLM_MODEL_2 --body "gpt-oss-120b"
+```
+
+A provider that answers `401`/`402`/`403` is skipped for the rest of that run
+rather than re-probed on every call. [freellm.net](https://freellm.net/) is a
+useful directory when you need another OpenAI-compatible free tier.
 
 ## Upgrade notes (breaking changes from earlier starters)
 

@@ -342,6 +342,142 @@ class TestRetiredEndpoint:
             agent.call_llm("sys", [{"role": "user", "content": "hi"}])
         assert mock_post.call_count == 1
 
+    @patch("agent.requests.post")
+    def test_402_fails_fast_with_billing_hint(self, mock_post):
+        """402 means the account is out of credit — retrying re-sends a
+        rejected key and burns the run for nothing."""
+        mock_post.return_value = MagicMock(
+            status_code=402, text='{"message": "insufficient credits"}'
+        )
+        with pytest.raises(RuntimeError, match="out of credit"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+        assert mock_post.call_count == 1
+
+    @patch("agent.requests.post")
+    def test_401_fails_fast_without_retrying(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=401, text="bad key")
+        with pytest.raises(RuntimeError, match="API key was rejected"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+        assert mock_post.call_count == 1
+
+
+
+class TestProviderFallbackChain:
+    """One provider is a single point of failure: when its free tier runs out
+    every scheduled run dies on 402. The chain hands the call to the next
+    configured provider instead of failing the whole run.
+    """
+
+    @staticmethod
+    def _ok(content="from the fallback"):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return resp
+
+    @staticmethod
+    def _configure_slot(monkeypatch, slot, endpoint, model, key="k"):
+        monkeypatch.setenv(f"LLM_ENDPOINT_{slot}", endpoint)
+        monkeypatch.setenv(f"LLM_MODEL_{slot}", model)
+        monkeypatch.setenv(f"LLM_API_KEY_{slot}", key)
+
+    @patch("agent.requests.post")
+    def test_402_on_first_provider_falls_over_to_second(self, mock_post, monkeypatch):
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "backup-model")
+        mock_post.side_effect = [
+            MagicMock(status_code=402, text="insufficient credits"),
+            self._ok(),
+        ]
+
+        result = agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+
+        assert result == "from the fallback"
+        assert mock_post.call_count == 2
+        assert mock_post.call_args_list[1].args[0] == "https://backup.example/v1"
+        assert mock_post.call_args_list[1].kwargs["json"]["model"] == "backup-model"
+
+    @patch("agent.requests.post")
+    def test_unknown_model_400_also_falls_over(self, mock_post, monkeypatch):
+        """A 400 used to escape as a bare HTTPError. Another provider may name
+        the model differently, so it is worth trying."""
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "backup-model")
+        mock_post.side_effect = [
+            MagicMock(status_code=400, text='{"error": "model not found"}'),
+            self._ok(),
+        ]
+
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "from the fallback"
+        assert mock_post.call_count == 2
+
+    @patch("agent.requests.post")
+    def test_every_provider_down_names_each_one(self, mock_post, monkeypatch):
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "backup-model")
+        mock_post.side_effect = [
+            MagicMock(status_code=402, text="insufficient credits"),
+            MagicMock(status_code=401, text="bad key"),
+        ]
+
+        with pytest.raises(RuntimeError) as exc:
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+
+        message = str(exc.value)
+        assert "out of credit" in message
+        assert "API key was rejected" in message
+        assert "https://backup.example/v1" in message
+
+    @patch("agent.requests.post")
+    def test_dead_provider_is_not_retried_on_the_next_call(self, mock_post, monkeypatch):
+        """`act` makes several LLM calls per run — re-probing a provider known
+        to be out of credit burns a round-trip every time."""
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "backup-model")
+        mock_post.side_effect = [
+            MagicMock(status_code=402, text="insufficient credits"),
+            self._ok(),
+            self._ok("second call"),
+        ]
+
+        agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "second call"
+
+        assert mock_post.call_count == 3
+        assert [c.args[0] for c in mock_post.call_args_list[1:]] == [
+            "https://backup.example/v1",
+            "https://backup.example/v1",
+        ]
+
+    @patch("agent.requests.post")
+    def test_reasoning_shape_is_decided_per_provider(self, mock_post, monkeypatch):
+        """The fallback may be a plain chat model — sending reasoning_effort to
+        it is a 400, so the shape must follow the slot that is actually used."""
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "gpt-4o-mini")
+        mock_post.side_effect = [
+            MagicMock(status_code=402, text="insufficient credits"),
+            self._ok(),
+        ]
+
+        with patch.object(agent, "LLM_MODEL", "gpt-oss-120b"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}], max_tokens=200)
+
+        primary_body = mock_post.call_args_list[0].kwargs["json"]
+        fallback_body = mock_post.call_args_list[1].kwargs["json"]
+        assert primary_body["reasoning_effort"] == agent.LLM_REASONING_EFFORT
+        assert primary_body["max_tokens"] == 200 * agent.REASONING_TOKEN_HEADROOM
+        assert "reasoning_effort" not in fallback_body
+        assert fallback_body["max_tokens"] == 200
+
+    @patch("agent.requests.post")
+    def test_half_configured_slot_is_ignored(self, mock_post, monkeypatch):
+        """A slot with an endpoint but no key must not join the chain and fail
+        the run at the moment it is reached."""
+        monkeypatch.setenv("LLM_ENDPOINT_2", "https://backup.example/v1")
+        monkeypatch.setenv("LLM_MODEL_2", "backup-model")
+
+        assert [p["endpoint"] for p in agent.llm_providers()] == [agent.LLM_ENDPOINT]
+
+        mock_post.return_value = MagicMock(status_code=402, text="no credit")
+        with pytest.raises(RuntimeError, match="out of credit"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+        assert mock_post.call_count == 1
+
 
 # ── CLI dispatch ───────────────────────────────────────────────
 

@@ -102,13 +102,22 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 # answers 410 Gone for every request. There is no drop-in GitHub replacement,
 # so the LLM is configured by env: point LLM_ENDPOINT at any OpenAI-compatible
 # /chat/completions URL and set LLM_API_KEY + LLM_MODEL to match.
-# Defaults target Cerebras. gpt-oss-120b is their only production model —
-# the others are preview and can be pulled on short notice, which is a bad
-# bet for an agent running unattended on a schedule.
+# Defaults target Groq. They were Cerebras until 2026-08-31, but Cerebras
+# grants a one-time $5 credit rather than a recurring free tier: an agent on a
+# schedule burns through it and then every run dies on 402 Payment Required.
+# Groq's free tier renews on daily rate limits instead, which is the shape an
+# unattended cron agent needs. Check current limits on their console before
+# raising the schedule frequency.
+#
+# One provider is still a single point of failure, so LLM_ENDPOINT_2 and
+# friends define a fallback chain — see llm_providers() and call_llm().
 LLM_ENDPOINT = os.environ.get(
-    "LLM_ENDPOINT", "https://api.cerebras.ai/v1/chat/completions"
+    "LLM_ENDPOINT", "https://api.groq.com/openai/v1/chat/completions"
 )
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss-120b")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
+# Extra fallback slots: LLM_ENDPOINT_2 / LLM_MODEL_2 / LLM_API_KEY_2, and so
+# on up to this many providers. See llm_providers().
+MAX_LLM_PROVIDERS = 4
 # Provider-agnostic on purpose: the key is named after its role, not its
 # vendor, so switching LLM_ENDPOINT doesn't leave a misnamed secret behind.
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
@@ -245,7 +254,7 @@ def recent_own_posts() -> list[str]:
 # ── LLM ────────────────────────────────────────────────────────
 
 
-def _extract_message_content(payload: dict) -> str:
+def _extract_message_content(payload: dict, model: str = "") -> str:
     """Pull the assistant text out of an OpenAI-shaped completion.
 
     Indexing straight into ["choices"][0]["message"]["content"] raises a bare
@@ -254,6 +263,7 @@ def _extract_message_content(payload: dict) -> str:
     budget thinking (no `content`, finish_reason "length"), and a provider
     that returns the text under `reasoning_content` instead.
     """
+    model = model or LLM_MODEL
     choices = payload.get("choices") or []
     if not choices:
         err = payload.get("error")
@@ -273,16 +283,169 @@ def _extract_message_content(payload: dict) -> str:
         if finish == "length":
             raise RuntimeError(
                 f"LLM hit the token limit before producing any text "
-                f"(model={LLM_MODEL}, finish_reason=length). "
+                f"(model={model}, finish_reason=length). "
                 "This is typical of a reasoning model whose budget was spent "
                 "thinking — lower LLM_REASONING_EFFORT or raise "
                 "REASONING_TOKEN_HEADROOM."
             )
         raise RuntimeError(
-            f"LLM returned an empty message (model={LLM_MODEL}, "
+            f"LLM returned an empty message (model={model}, "
             f"finish_reason={finish}, keys={sorted(message)})"
         )
     return content.strip()
+
+
+# A provider that answers 401/402/403 is dead for the rest of this process —
+# the same credentials would be re-sent on every later call, and `act` makes
+# several LLM calls per run. Remembering the corpse saves a round-trip each
+# time. Process-scoped, so a top-up is picked up on the next run.
+_DEAD_PROVIDERS: set[str] = set()
+
+
+class _ProviderFailure(Exception):
+    """This provider can't serve the call; the chain moves to the next one."""
+
+    def __init__(self, reason: str, permanent: bool = False):
+        super().__init__(reason)
+        self.reason = reason
+        # permanent = account-side (bad key, no credit, retired endpoint).
+        # Retrying it later in the same run is guaranteed waste.
+        self.permanent = permanent
+
+
+def llm_providers() -> list[dict]:
+    """The ordered fallback chain, resolved at call time.
+
+    Slot 1 is the LLM_ENDPOINT / LLM_MODEL / LLM_API_KEY globals, read through
+    the module namespace so tests can patch them. Slots 2+ come from numbered
+    env vars (LLM_ENDPOINT_2 / LLM_MODEL_2 / LLM_API_KEY_2, ...). They stay as
+    separate vars rather than one JSON blob because endpoints and model IDs are
+    public (repo variables) while keys are secrets — bundling them would force
+    the whole chain into a secret and make rotating one key a rewrite of all.
+
+    A slot needs all three fields to count; a half-configured slot is skipped
+    rather than failing the run at the moment it is reached.
+    """
+    chain = [{"endpoint": LLM_ENDPOINT, "model": LLM_MODEL, "key": llm_api_key()}]
+    for slot in range(2, MAX_LLM_PROVIDERS + 1):
+        chain.append(
+            {
+                "endpoint": os.environ.get(f"LLM_ENDPOINT_{slot}", "").strip(),
+                "model": os.environ.get(f"LLM_MODEL_{slot}", "").strip(),
+                "key": os.environ.get(f"LLM_API_KEY_{slot}", "").strip(),
+            }
+        )
+    return [p for p in chain if p["endpoint"] and p["model"] and p["key"]]
+
+
+def _provider_id(provider: dict) -> str:
+    return f"{provider['endpoint']}::{provider['model']}"
+
+
+def _llm_request_body(
+    provider: dict,
+    system_prompt: str,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+) -> dict:
+    """Per-provider body: the reasoning shape depends on *this* slot's model,
+    not on whatever slot 1 happens to be."""
+    body = {
+        "model": provider["model"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            *messages,
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if is_reasoning_model(provider["model"]):
+        body["max_tokens"] = max_tokens * REASONING_TOKEN_HEADROOM
+        if LLM_REASONING_EFFORT:
+            body["reasoning_effort"] = LLM_REASONING_EFFORT
+    return body
+
+
+def _call_one_provider(provider: dict, body: dict) -> str:
+    """Up to 3 attempts against a single provider.
+
+    Raises _ProviderFailure to hand over to the next link in the chain; every
+    non-success path ends there, so call_llm never sees a bare HTTPError.
+    """
+    last_error: Optional[str] = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                provider["endpoint"],
+                headers={
+                    "Authorization": f"Bearer {provider['key']}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+            time.sleep(3)
+            continue
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"connection: {e}"
+            time.sleep(3)
+            continue
+
+        # 410 Gone is what a retired endpoint returns — retrying never helps.
+        # GitHub Models was the old default and was retired on 2026-07-30.
+        if resp.status_code == 410:
+            raise _ProviderFailure(
+                "410 Gone — this endpoint has been retired", permanent=True
+            )
+        # 401/402/403 are account-side: a bad key, an exhausted balance, or a
+        # key without access to this model. Retrying re-sends the same rejected
+        # credentials, so fail over immediately with the provider's own message.
+        if resp.status_code in (401, 402, 403):
+            reason = {
+                401: "401 — the API key was rejected",
+                402: "402 — the account is out of credit or has no active billing",
+                403: "403 — the key is not allowed to use this model",
+            }[resp.status_code]
+            detail = (resp.text or "")[:300].strip()
+            raise _ProviderFailure(
+                f"{reason}. Provider said: {detail or '(no body)'}", permanent=True
+            )
+        if resp.status_code == 429:
+            last_error = "rate limited (429)"
+            wait = min(2**attempt * 5, 30)
+            print(f"  Rate limited, retrying in {wait}s...")
+            time.sleep(wait)
+            continue
+        # Retry transient 5xx (bad gateway / overload / upstream timeout) —
+        # these are common from proxies and usually recover on a second try.
+        if 500 <= resp.status_code < 600:
+            last_error = f"HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+            wait = min(2**attempt * 3, 20)
+            print(f"  LLM {resp.status_code}, retrying in {wait}s...")
+            time.sleep(wait)
+            continue
+        # Any other 4xx is a request this provider won't serve — an unknown
+        # model ID, an unsupported param. Another provider may well accept it,
+        # so hand over instead of raising a bare HTTPError from the stack.
+        if resp.status_code >= 400:
+            detail = (resp.text or "")[:300].strip()
+            raise _ProviderFailure(
+                f"HTTP {resp.status_code} — request rejected. "
+                f"Provider said: {detail or '(no body)'}",
+                permanent=True,
+            )
+
+        try:
+            return _extract_message_content(resp.json(), provider["model"])
+        except RuntimeError as e:
+            # A malformed or empty reply is this provider's problem, not the
+            # caller's — let the next one try before giving up on the run.
+            raise _ProviderFailure(str(e)) from e
+
+    raise _ProviderFailure(f"failed after 3 attempts ({last_error or 'unknown'})")
 
 
 def call_llm(
@@ -291,68 +454,43 @@ def call_llm(
     max_tokens: int = 300,
     temperature: float = 0.7,
 ) -> str:
-    api_key = llm_api_key()
-    if not api_key:
-        raise RuntimeError("LLM_API_KEY (or GITHUB_TOKEN) is required for LLM calls")
-    body = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            *messages,
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if is_reasoning_model():
-        body["max_tokens"] = max_tokens * REASONING_TOKEN_HEADROOM
-        if LLM_REASONING_EFFORT:
-            body["reasoning_effort"] = LLM_REASONING_EFFORT
+    """Call the first provider in the chain that answers, in order."""
+    providers = llm_providers()
+    if not providers:
+        raise RuntimeError(
+            "LLM_API_KEY (or GITHUB_TOKEN) is required for LLM calls — set it "
+            "alongside LLM_ENDPOINT and LLM_MODEL for your provider"
+        )
 
-    last_error: Optional[str] = None
-    for attempt in range(3):
+    failures: list[str] = []
+    for provider in providers:
+        label = f"{provider['endpoint']} (model={provider['model']})"
+        if _provider_id(provider) in _DEAD_PROVIDERS:
+            failures.append(f"{label}: skipped, already failed earlier this run")
+            continue
+        body = _llm_request_body(
+            provider, system_prompt, messages, max_tokens, temperature
+        )
         try:
-            resp = requests.post(
-                LLM_ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=30,
-            )
-            # 410 Gone is what a retired endpoint returns — retrying never
-            # helps, and the bare HTTPError hides *why*. GitHub Models was
-            # the old default and was retired on 2026-07-30.
-            if resp.status_code == 410:
-                raise RuntimeError(
-                    f"LLM endpoint {LLM_ENDPOINT} returned 410 Gone — it has been "
-                    "retired. GitHub Models shut down on 2026-07-30; set "
-                    "LLM_ENDPOINT / LLM_MODEL / LLM_API_KEY to another "
-                    "OpenAI-compatible provider."
-                )
-            if resp.status_code == 429:
-                wait = min(2**attempt * 5, 30)
-                print(f"  Rate limited, retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-            # Retry transient 5xx (bad gateway / overload / upstream timeout)
-            # — these are common from proxies and almost always recover on
-            # a second try. Non-transient 4xx still raise immediately.
-            if 500 <= resp.status_code < 600:
-                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                wait = min(2**attempt * 3, 20)
-                print(f"  LLM {resp.status_code}, retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return _extract_message_content(resp.json())
-        except requests.exceptions.Timeout:
-            last_error = "timeout"
-            time.sleep(3)
-        except requests.exceptions.ConnectionError as e:
-            last_error = f"connection: {e}"
-            time.sleep(3)
-    raise RuntimeError(f"LLM call failed after 3 attempts ({last_error or 'unknown'})")
+            return _call_one_provider(provider, body)
+        except _ProviderFailure as e:
+            if e.permanent:
+                _DEAD_PROVIDERS.add(_provider_id(provider))
+            failures.append(f"{label}: {e.reason}")
+            if len(providers) > 1:
+                print(f"  LLM provider failed ({label}): {e.reason}")
+
+    summary = "\n".join(f"  - {f}" for f in failures)
+    headline = (
+        "The LLM provider failed:"
+        if len(failures) == 1
+        else f"All {len(failures)} LLM providers failed:"
+    )
+    raise RuntimeError(
+        f"{headline}\n{summary}\n"
+        "Point LLM_ENDPOINT / LLM_MODEL / LLM_API_KEY (or the _2 / _3 fallback "
+        "slots) at a working OpenAI-compatible provider."
+    )
 
 
 # ── API helpers ────────────────────────────────────────────────
