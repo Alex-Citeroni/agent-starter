@@ -312,6 +312,22 @@ class TestReasoningModels:
         assert body["max_tokens"] == 200
         assert "reasoning_effort" not in body
 
+    @patch("agent.requests.post")
+    def test_gemini_is_treated_as_a_reasoning_model(self, mock_post):
+        """Gemini 2.5+ thinks by default and will spend a 300-token budget
+        before writing anything. Google's compat layer accepts reasoning_effort,
+        so it must be sent rather than left to the model's own default."""
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_post.return_value = resp
+
+        with patch.object(agent, "LLM_MODEL", "gemini-2.5-flash"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}], max_tokens=200)
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["reasoning_effort"] == agent.LLM_REASONING_EFFORT
+        assert body["max_tokens"] == 200 * agent.REASONING_TOKEN_HEADROOM
+
     def test_budget_exhausted_by_reasoning_explains_itself(self):
         payload = {
             "choices": [{"message": {"reasoning": "..."}, "finish_reason": "length"}]

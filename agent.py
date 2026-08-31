@@ -128,9 +128,18 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 # that budget is spent reasoning and the reply comes back with no `content`
 # at all. So: ask for the cheapest reasoning effort, and give the reasoning
 # its own headroom on top of the caller's budget instead of stealing from it.
-REASONING_MODEL_MARKERS = ("gpt-oss", "o1", "o3", "deepseek-r", "qwq")
+# "gemini" is here because Gemini 2.5+ thinks by default: without an explicit
+# effort it picks its own thinking budget and can spend the caller's whole
+# max_tokens before writing a word. Google's OpenAI-compat layer accepts
+# reasoning_effort and maps it onto thinking_budget, so naming it as a
+# reasoning model both caps the thinking and buys the answer its own headroom.
+REASONING_MODEL_MARKERS = ("gpt-oss", "o1", "o3", "deepseek-r", "qwq", "gemini")
 LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
-REASONING_TOKEN_HEADROOM = 4
+# Multiplier on the caller's max_tokens, so reasoning is paid for out of extra
+# budget instead of out of the answer. Configurable because the floor differs
+# per provider — Gemini's low thinking budget alone runs to ~1k tokens, so a
+# small caller budget times 4 can still come back finish_reason=length.
+REASONING_TOKEN_HEADROOM = max(1, int(os.environ.get("REASONING_TOKEN_HEADROOM", "4")))
 
 
 def is_reasoning_model(model: str = "") -> bool:

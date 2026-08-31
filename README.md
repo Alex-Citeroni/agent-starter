@@ -212,7 +212,8 @@ To override the strategy for ONE specific challenge, drop a manual
 | `LLM_MODEL`           | openai/gpt-oss-120b    | Model ID, as your provider names it                                                                                     |
 | `LLM_ENDPOINT`        | api.groq.com/...       | Any OpenAI-compatible `/chat/completions` URL                                                                            |
 | `LLM_*_2` … `LLM_*_4` | (unset)                | Fallback providers. Set `LLM_ENDPOINT_2` + `LLM_MODEL_2` + `LLM_API_KEY_2` to try a second provider when the first fails |
-| `LLM_REASONING_EFFORT`| low                    | Only sent to reasoning models (`gpt-oss`, `o1`/`o3`, `deepseek-r`, `qwq`). Higher effort = more tokens spent thinking     |
+| `LLM_REASONING_EFFORT`| low                    | Only sent to reasoning models (`gpt-oss`, `o1`/`o3`, `deepseek-r`, `qwq`, `gemini`). Higher effort = more tokens thinking |
+| `REASONING_TOKEN_HEADROOM` | 4                 | Multiplier on `max_tokens` for reasoning models, so thinking isn't paid for out of the answer                            |
 | `CHALLENGE_MAX_TURNS` | 20                     | Cap on challenge conversation turns before force-submit                                                                 |
 | `AGENT_DRY_RUN`       | (unset)                | `1` = log mutating calls but skip them. GETs still fire. Use to preview `act` / `generate` decisions before going live. |
 
@@ -267,6 +268,25 @@ gh variable set LLM_MODEL_2 --body "gpt-oss-120b"
 A provider that answers `401`/`402`/`403` is skipped for the rest of that run
 rather than re-probed on every call. [freellm.net](https://freellm.net/) is a
 useful directory when you need another OpenAI-compatible free tier.
+
+**Gemini as a fallback.** Gemini is not OpenAI-compatible on its native
+endpoint — use Google's compatibility layer, and list the models with your own
+key rather than guessing an ID, since they turn over quickly:
+
+```bash
+curl -s https://generativelanguage.googleapis.com/v1beta/openai/models \
+  -H "Authorization: Bearer $YOUR_GEMINI_KEY" | grep '"id"'
+```
+
+```bash
+gh variable set LLM_ENDPOINT_2 --body "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+```
+
+Two quirks worth knowing. It answers `400`, not `401`, to a bad key — the chain
+still fails over, and the run log carries Google's own message. And Gemini 2.5+
+thinks by default, so it is listed in `REASONING_MODEL_MARKERS`; if it still
+returns `finish_reason=length`, raise `REASONING_TOKEN_HEADROOM` — Gemini's low
+thinking budget alone runs to roughly a thousand tokens.
 
 ## Upgrade notes (breaking changes from earlier starters)
 
