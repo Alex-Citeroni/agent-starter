@@ -595,6 +595,12 @@ def api(method: str, path: str, payload: Optional[dict] = None) -> dict:
             "status": resp.status_code,
             "error": body.get("error") or resp.text[:300],
         }
+    # Record the status on every failure. A JSON body that already says
+    # success:false is passed through untouched above, which used to leave
+    # callers unable to tell a 400 (never going to work) from a dropped
+    # connection (worth another go) — both arrived with no status at all.
+    if not resp.ok:
+        body.setdefault("status", resp.status_code)
     # Surface rate-limit details explicitly so callers can print "429:
     # reset at HH:MM" rather than a raw dict.
     if resp.status_code == 429:
@@ -604,6 +610,27 @@ def api(method: str, path: str, payload: Optional[dict] = None) -> dict:
 
 def is_rate_limited(data: dict) -> bool:
     return bool(data.get("rate_limited") or data.get("status") == 429)
+
+
+def is_retryable_failure(data: dict) -> bool:
+    """True when a failed api() dict is worth attempting again on a later run.
+
+    The distinction matters for anything that keeps a notification unread in
+    order to retry: an hourly rate limit clears on its own, but a refusal the
+    API will repeat forever — a duplicate comment, a spam guard, a malformed
+    request — turns "retry later" into an LLM call burnt every scheduled run.
+
+    A genuine rate limit is the 429 that carries retry_after_seconds; the spam
+    guards reuse 429 without it and are final for that target.
+    """
+    if data.get("success"):
+        return False
+    if data.get("retry_after_seconds") is not None:
+        return True
+    status = data.get("status")
+    if status is None:
+        return True  # never reached the API (network / connection error)
+    return status >= 500
 
 
 def is_auth_error(data: dict) -> bool:
@@ -954,7 +981,7 @@ def cmd_generate(topic: Optional[str] = None):
     cmd_post(text, category=category)
 
 
-def cmd_comment(post_id: str, text: str, parent_id: Optional[str] = None) -> bool:
+def cmd_comment(post_id: str, text: str, parent_id: Optional[str] = None) -> dict:
     """Comment on a post, or reply to a comment on it when parent_id is given.
 
     The platform rejects a *top-level* comment on your own post ("reads as
@@ -970,9 +997,9 @@ def cmd_comment(post_id: str, text: str, parent_id: Optional[str] = None) -> boo
         cid = (data.get("data") or {}).get("comment_id", "ok")
         where = f"{post_id} (reply to {parent_id})" if parent_id else post_id
         print(f"Commented on {where} (comment_id={cid})")
-        return True
+        return data
     print(f"Failed: {format_error(data)}")
-    return False
+    return data
 
 
 def cmd_react(post_id: str, emoji: str = "❤️"):
@@ -1373,11 +1400,16 @@ def _handle_engagement_notification(notif: dict, identity: dict) -> None:
     parent_id = notif.get("comment_id")
     target = f"comment {parent_id}" if parent_id else f"post {post_id}"
     print(f"\nReplying to @{actor}'s {ntype} on {target}: {reply[:80]}")
-    if not cmd_comment(post_id, reply, parent_id=parent_id):
-        # Leave it unread: a burnt notification is a conversation dropped in
-        # silence, and the run still reports itself as having handled it.
-        print("  Reply rejected — leaving the notification unread to retry.")
-        return
+    result = cmd_comment(post_id, reply, parent_id=parent_id)
+    if not result.get("success"):
+        if is_retryable_failure(result):
+            # A burnt notification is a conversation dropped in silence, and
+            # the run still reports itself as having handled it.
+            print("  Reply failed for now — leaving it unread to retry.")
+            return
+        # Permanent refusals (duplicate, spam guard, malformed) would be
+        # refused identically every run, and each attempt costs an LLM call.
+        print("  Reply refused permanently — marking read to stop retrying.")
     _mark_notification_read(notif["id"])
 
 

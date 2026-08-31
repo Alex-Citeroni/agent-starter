@@ -506,7 +506,7 @@ class TestReplyToComments:
     def test_parent_id_is_sent_when_replying(self, mock_api):
         mock_api.return_value = {"success": True, "data": {"comment_id": "new"}}
 
-        assert agent.cmd_comment("p1", "thanks", parent_id="c9") is True
+        assert agent.cmd_comment("p1", "thanks", parent_id="c9")["success"] is True
 
         payload = mock_api.call_args.args[2]
         assert payload["post_id"] == "p1"
@@ -523,9 +523,15 @@ class TestReplyToComments:
         assert "parent_id" not in mock_api.call_args.args[2]
 
     @patch("agent.api")
-    def test_rejected_comment_reports_failure(self, mock_api):
-        mock_api.return_value = {"success": False, "error": "This is your own post"}
-        assert agent.cmd_comment("p1", "hello") is False
+    def test_rejected_comment_returns_the_reason(self, mock_api):
+        """The caller needs the reason, not just a boolean — whether to retry
+        depends on which refusal it was."""
+        mock_api.return_value = {
+            "success": False, "status": 400, "error": "This is your own post"
+        }
+        result = agent.cmd_comment("p1", "hello")
+        assert result["success"] is False
+        assert result["status"] == 400
 
     @patch("agent._mark_notification_read")
     @patch("agent.cmd_comment")
@@ -534,7 +540,7 @@ class TestReplyToComments:
         self, mock_llm, mock_comment, mock_read
     ):
         mock_llm.return_value = "good question — here is why"
-        mock_comment.return_value = True
+        mock_comment.return_value = {"success": True, "data": {"comment_id": "x"}}
         notif = {
             "id": "n1",
             "type": "comment",
@@ -552,13 +558,16 @@ class TestReplyToComments:
     @patch("agent._mark_notification_read")
     @patch("agent.cmd_comment")
     @patch("agent.call_llm")
-    def test_failed_reply_leaves_the_notification_unread(
+    def test_transient_failure_leaves_the_notification_unread(
         self, mock_llm, mock_comment, mock_read
     ):
         """Marking it read on failure drops the conversation in silence and
         still counts the notification as handled."""
         mock_llm.return_value = "a reply"
-        mock_comment.return_value = False
+        mock_comment.return_value = {
+            "success": False, "status": 429, "rate_limited": True,
+            "retry_after_seconds": 3600, "error": "Rate limit exceeded",
+        }
         notif = {
             "id": "n1",
             "type": "comment",
@@ -571,6 +580,29 @@ class TestReplyToComments:
         agent._handle_engagement_notification(notif, {"username": "bot"})
 
         mock_read.assert_not_called()
+
+    @patch("agent._mark_notification_read")
+    @patch("agent.cmd_comment")
+    @patch("agent.call_llm")
+    def test_permanent_refusal_stops_the_retry_loop(
+        self, mock_llm, mock_comment, mock_read
+    ):
+        """autorun runs every 15 minutes and spends an LLM call before each
+        attempt. Retrying a refusal the API will repeat forever is a bill, not
+        a recovery."""
+        mock_llm.return_value = "a reply"
+        mock_comment.return_value = {
+            "success": False, "status": 409,
+            "error": "A similar comment already exists on this post",
+        }
+        notif = {
+            "id": "n1", "type": "comment", "post_id": "p1", "comment_id": "c9",
+            "comment_preview": "why?", "actor": {"username": "other"},
+        }
+
+        agent._handle_engagement_notification(notif, {"username": "bot"})
+
+        mock_read.assert_called_once_with("n1")
 
     @patch("agent.cmd_comment")
     @patch("agent.call_llm")
@@ -637,6 +669,59 @@ class TestReplyToComments:
 
         prompt = mock_llm.call_args.args[1][0]["content"]
         assert "comment=c9" in prompt
+
+
+
+class TestFailureClassification:
+    """The platform reuses 429 for two different things: the hourly rate limit
+    (clears itself, carries retry_after_seconds) and the per-post spam guards
+    (final for that target). Only the first is worth retrying.
+    """
+
+    def test_real_rate_limit_is_retryable(self):
+        assert agent.is_retryable_failure(
+            {"success": False, "status": 429, "retry_after_seconds": 3600}
+        )
+
+    def test_spam_guard_429_is_not_retryable(self):
+        assert not agent.is_retryable_failure(
+            {
+                "success": False, "status": 429,
+                "error": "You have already commented on this post multiple times",
+            }
+        )
+
+    def test_duplicate_409_is_not_retryable(self):
+        assert not agent.is_retryable_failure({"success": False, "status": 409})
+
+    def test_bad_request_is_not_retryable(self):
+        assert not agent.is_retryable_failure({"success": False, "status": 400})
+
+    def test_server_error_is_retryable(self):
+        assert agent.is_retryable_failure({"success": False, "status": 503})
+
+    def test_network_error_is_retryable(self):
+        """No status at all means the request never reached the API."""
+        assert agent.is_retryable_failure({"success": False, "error": "network: boom"})
+
+    def test_success_is_never_retryable(self):
+        assert not agent.is_retryable_failure({"success": True})
+
+
+class TestApiRecordsStatus:
+    @patch("agent.requests.post")
+    def test_status_is_kept_on_a_json_error_body(self, mock_post):
+        """A body that already says success:false is passed through — it used
+        to arrive with no status, making 400 and a dropped connection look
+        identical to callers deciding whether to retry."""
+        resp = MagicMock(status_code=409, ok=False, url="https://test.example.com/x")
+        resp.json.return_value = {"success": False, "error": "duplicate"}
+        mock_post.return_value = resp
+
+        data = agent.api("POST", "/api/v1/agents/comment", {"post_id": "p1"})
+
+        assert data["status"] == 409
+        assert agent.is_retryable_failure(data) is False
 
 
 # ── CLI dispatch ───────────────────────────────────────────────
