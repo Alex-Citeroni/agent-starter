@@ -266,6 +266,14 @@ Endpoints and model IDs are public — put them in repo **variables**. Keys go i
 repo **secrets**. A slot missing any of its three fields is skipped, so a
 half-configured fallback can't break a run.
 
+Within a slot the call gets three attempts, with backoff only *between* them —
+never after the last, which would buy a retry that never happens. If the
+provider sends a `Retry-After`, that number is used instead of the guess, and a
+wait longer than 30s hands the call straight to the next slot rather than
+sleeping through a quota window. A slot that burns all three attempts on `429`
+is then skipped for the rest of the run: the window is still open on the next
+call, and `act` makes several.
+
 ```bash
 gh secret set LLM_API_KEY_2
 gh variable set LLM_ENDPOINT_2 --body "https://api.cerebras.ai/v1/chat/completions"

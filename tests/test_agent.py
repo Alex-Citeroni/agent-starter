@@ -6,7 +6,9 @@ import json
 import tempfile
 import pytest
 import requests
-from unittest.mock import patch, MagicMock
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+from unittest.mock import call, patch, MagicMock
 
 # Add parent dir to path so we can import agent
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -493,6 +495,226 @@ class TestProviderFallbackChain:
         with pytest.raises(RuntimeError, match="out of credit"):
             agent.call_llm("sys", [{"role": "user", "content": "hi"}])
         assert mock_post.call_count == 1
+
+
+
+class TestRetryBudget:
+    """Backoff exists to bridge the gap to the *next* attempt.
+
+    Sleeping after the last one buys nothing: the run pays 20s of wall clock
+    and then gives up anyway, which is what turned a two-provider outage into
+    a seven-minute CI job.
+    """
+
+    @staticmethod
+    def _resp(status, headers=None, text=""):
+        return MagicMock(status_code=status, headers=headers or {}, text=text)
+
+    @staticmethod
+    def _ok(content="ok"):
+        resp = MagicMock(status_code=200, headers={})
+        resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return resp
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_429_does_not_sleep_after_the_final_attempt(self, mock_post, mock_sleep):
+        mock_post.return_value = self._resp(429)
+
+        with pytest.raises(RuntimeError, match="failed after 3 attempts"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+
+        assert mock_post.call_count == agent.LLM_ATTEMPTS_PER_PROVIDER
+        # Two gaps between three attempts — never a trailing one.
+        assert mock_sleep.call_count == agent.LLM_ATTEMPTS_PER_PROVIDER - 1
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [5, 10]
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_5xx_does_not_sleep_after_the_final_attempt(self, mock_post, mock_sleep):
+        mock_post.return_value = self._resp(503, text="high demand")
+
+        with pytest.raises(RuntimeError, match="failed after 3 attempts"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+
+        assert mock_post.call_count == 3
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [3, 6]
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_timeout_does_not_sleep_after_the_final_attempt(self, mock_post, mock_sleep):
+        mock_post.side_effect = agent.requests.exceptions.Timeout()
+
+        with pytest.raises(RuntimeError, match="timeout"):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+
+        assert mock_sleep.call_count == 2
+
+
+class TestRetryAfterHeader:
+    """A provider that names its own wait is more accurate than our guess —
+    and when the wait it names outlasts the run, the chain should move on
+    instead of sleeping through it."""
+
+    @staticmethod
+    def _configure_slot(monkeypatch, slot, endpoint, model, key="k"):
+        monkeypatch.setenv(f"LLM_ENDPOINT_{slot}", endpoint)
+        monkeypatch.setenv(f"LLM_MODEL_{slot}", model)
+        monkeypatch.setenv(f"LLM_API_KEY_{slot}", key)
+
+    @staticmethod
+    def _ok(content="from the fallback"):
+        resp = MagicMock(status_code=200, headers={})
+        resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return resp
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_long_retry_after_fails_over_immediately(
+        self, mock_post, mock_sleep, monkeypatch
+    ):
+        """Groq answers a spent daily quota with a Retry-After in the hours.
+        Burning three attempts and 35s of backoff on that is pure waste."""
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "backup")
+        mock_post.side_effect = [
+            MagicMock(status_code=429, headers={"Retry-After": "3600"}, text=""),
+            self._ok(),
+        ]
+
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "from the fallback"
+
+        # One shot at the rate-limited provider, then straight to the next.
+        assert mock_post.call_count == 2
+        assert mock_sleep.call_count == 0
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_short_retry_after_is_honoured_over_the_guess(self, mock_post, mock_sleep):
+        """Within the cap, the provider's number beats our exponential guess."""
+        retry = MagicMock(status_code=429, headers={"Retry-After": "7"}, text="")
+        ok = MagicMock(status_code=200, headers={})
+        ok.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_post.side_effect = [retry, ok]
+
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "ok"
+        assert mock_sleep.call_args_list == [call(7.0)]
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_missing_header_falls_back_to_exponential_backoff(
+        self, mock_post, mock_sleep
+    ):
+        retry = MagicMock(status_code=429, headers={}, text="")
+        ok = MagicMock(status_code=200, headers={})
+        ok.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_post.side_effect = [retry, ok]
+
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "ok"
+        assert mock_sleep.call_args_list == [call(5)]
+
+    def test_parses_seconds_and_http_dates_and_ignores_junk(self):
+        assert agent._retry_after_seconds(MagicMock(headers={"Retry-After": "12"})) == 12
+        assert agent._retry_after_seconds(MagicMock(headers={"retry-after": 8})) == 8
+        assert agent._retry_after_seconds(MagicMock(headers={})) is None
+        assert agent._retry_after_seconds(MagicMock(headers={"Retry-After": "soon"})) is None
+        # A bare MagicMock hands back a Mock for any header, which must read as
+        # "not stated" rather than blowing up the retry path.
+        assert agent._retry_after_seconds(MagicMock()) is None
+
+        future = datetime.now(timezone.utc) + timedelta(seconds=45)
+        stamp = format_datetime(future)
+        parsed = agent._retry_after_seconds(MagicMock(headers={"Retry-After": stamp}))
+        assert parsed is not None and 30 <= parsed <= 50
+
+        past = format_datetime(datetime.now(timezone.utc) - timedelta(hours=1))
+        assert agent._retry_after_seconds(MagicMock(headers={"Retry-After": past})) == 0
+
+    def test_format_wait_is_human_readable(self):
+        assert agent._format_wait(20) == "20s"
+        assert agent._format_wait(90) == "1m30s"
+        assert agent._format_wait(120) == "2m"
+        assert agent._format_wait(3600) == "1h"
+        assert agent._format_wait(3900) == "1h5m"
+
+
+class TestRateLimitedProviderIsSkipped:
+    """`act` makes several LLM calls per run. Once a provider has burned every
+    attempt on 429, the window is still open on the next call — re-probing it
+    re-charges the whole backoff for a result we already know."""
+
+    @staticmethod
+    def _configure_slot(monkeypatch, slot, endpoint, model, key="k"):
+        monkeypatch.setenv(f"LLM_ENDPOINT_{slot}", endpoint)
+        monkeypatch.setenv(f"LLM_MODEL_{slot}", model)
+        monkeypatch.setenv(f"LLM_API_KEY_{slot}", key)
+
+    @staticmethod
+    def _ok(content="from the fallback"):
+        resp = MagicMock(status_code=200, headers={})
+        resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return resp
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_exhausted_by_429_is_skipped_next_call(
+        self, mock_post, mock_sleep, monkeypatch
+    ):
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "backup")
+        mock_post.side_effect = [
+            MagicMock(status_code=429, headers={}, text=""),
+            MagicMock(status_code=429, headers={}, text=""),
+            MagicMock(status_code=429, headers={}, text=""),
+            self._ok(),
+            self._ok("second call"),
+        ]
+
+        agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "second call"
+
+        # 3 attempts on the primary + 1 fallback, then the second call goes
+        # straight to the fallback without re-probing the rate-limited primary.
+        assert mock_post.call_count == 5
+        assert mock_post.call_args_list[4].args[0] == "https://backup.example/v1"
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_a_429_that_recovers_does_not_condemn_the_provider(
+        self, mock_post, mock_sleep
+    ):
+        """A single 429 that clears on retry is ordinary throttling, not a
+        spent quota — the provider must stay in the chain."""
+        mock_post.side_effect = [
+            MagicMock(status_code=429, headers={}, text=""),
+            self._ok("first"),
+            self._ok("second"),
+        ]
+
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "first"
+        assert agent.call_llm("sys", [{"role": "user", "content": "hi"}]) == "second"
+        assert agent._DEAD_PROVIDERS == {}
+
+    @patch("agent.time.sleep")
+    @patch("agent.requests.post")
+    def test_skip_message_names_the_reason(self, mock_post, mock_sleep, monkeypatch):
+        """When every provider is out, the summary has to explain the skip —
+        'already failed' alone sends the reader back to the previous run."""
+        self._configure_slot(monkeypatch, 2, "https://backup.example/v1", "backup")
+        mock_post.side_effect = [
+            MagicMock(status_code=429, headers={"Retry-After": "3600"}, text=""),
+            MagicMock(status_code=401, headers={}, text="bad key"),
+        ]
+
+        with pytest.raises(RuntimeError):
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+        with pytest.raises(RuntimeError) as exc:
+            agent.call_llm("sys", [{"role": "user", "content": "hi"}])
+
+        # Both providers are condemned, so the second call sends nothing.
+        assert mock_post.call_count == 2
+        message = str(exc.value)
+        assert message.count("skipped — already failed this run") == 2
+        assert "1h" in message
+        assert "API key was rejected" in message
 
 
 

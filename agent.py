@@ -81,6 +81,8 @@ import sys
 import json
 import time
 import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from urllib.parse import urlparse
 import requests
@@ -306,22 +308,36 @@ def _extract_message_content(payload: dict, model: str = "") -> str:
     return content.strip()
 
 
-# A provider that answers 401/402/403 is dead for the rest of this process —
-# the same credentials would be re-sent on every later call, and `act` makes
-# several LLM calls per run. Remembering the corpse saves a round-trip each
-# time. Process-scoped, so a top-up is picked up on the next run.
-_DEAD_PROVIDERS: set[str] = set()
+# Providers the chain has given up on for the rest of this process, mapped to
+# the reason — a 401/402/403 would re-send the same rejected credentials, and a
+# spent rate-limit window would re-charge the full backoff. `act` makes several
+# LLM calls per run, so remembering saves a round-trip (or a minute of sleeping)
+# each time. Process-scoped, so a top-up or a fresh quota window is picked up on
+# the next run.
+_DEAD_PROVIDERS: dict[str, str] = {}
+
+# Attempts against a single provider before the chain moves on. Named so the
+# loop and the message it raises can't drift apart.
+LLM_ATTEMPTS_PER_PROVIDER = 3
+# The longest a provider's own Retry-After may ask us to wait. Groq answers a
+# spent free-tier quota with a Retry-After measured in minutes-to-hours: that
+# outlasts the run, and the next provider in the chain is one round-trip away.
+MAX_RETRY_AFTER_WAIT = 30
 
 
 class _ProviderFailure(Exception):
     """This provider can't serve the call; the chain moves to the next one."""
 
-    def __init__(self, reason: str, permanent: bool = False):
+    def __init__(self, reason: str, permanent: bool = False, exhausted: bool = False):
         super().__init__(reason)
         self.reason = reason
         # permanent = account-side (bad key, no credit, retired endpoint).
         # Retrying it later in the same run is guaranteed waste.
         self.permanent = permanent
+        # exhausted = don't come back to this provider this run. Permanent
+        # failures qualify by definition; so does a rate-limit window we have
+        # just proved we're inside.
+        self.exhausted = exhausted or permanent
 
 
 def llm_providers() -> list[dict]:
@@ -378,14 +394,73 @@ def _llm_request_body(
     return body
 
 
+def _format_wait(seconds: float) -> str:
+    """Compact human duration — a Retry-After of 3600 should read as an hour,
+    not as a four-digit number the reader has to divide."""
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs}s" if secs else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes}m" if minutes else f"{hours}h"
+
+
+def _retry_after_seconds(resp) -> Optional[float]:
+    """Seconds this provider asked us to wait, or None if it didn't say.
+
+    RFC 9110 allows Retry-After to be either a delay in seconds or an HTTP-date;
+    Groq sends the former, some proxies the latter. Anything else — including
+    the attribute a test double hands back — counts as "not stated", so a
+    missing header falls through to the exponential backoff below.
+    """
+    headers = getattr(resp, "headers", None)
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except (AttributeError, TypeError):
+        return None
+
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return max(0.0, float(raw))
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
 def _call_one_provider(provider: dict, body: dict) -> str:
-    """Up to 3 attempts against a single provider.
+    """Up to LLM_ATTEMPTS_PER_PROVIDER attempts against a single provider.
 
     Raises _ProviderFailure to hand over to the next link in the chain; every
     non-success path ends there, so call_llm never sees a bare HTTPError.
+
+    Backoff only ever runs *between* attempts: sleeping after the last one is
+    time the run pays for a retry it will never make.
     """
     last_error: Optional[str] = None
-    for attempt in range(3):
+    # A provider that burned every attempt on 429 has proved we're inside its
+    # rate-limit window; later calls this run should skip it rather than pay
+    # the whole backoff again.
+    rate_limited = False
+
+    for attempt in range(LLM_ATTEMPTS_PER_PROVIDER):
+        final = attempt == LLM_ATTEMPTS_PER_PROVIDER - 1
         try:
             resp = requests.post(
                 provider["endpoint"],
@@ -398,10 +473,14 @@ def _call_one_provider(provider: dict, body: dict) -> str:
             )
         except requests.exceptions.Timeout:
             last_error = "timeout"
+            if final:
+                break
             time.sleep(3)
             continue
         except requests.exceptions.ConnectionError as e:
             last_error = f"connection: {e}"
+            if final:
+                break
             time.sleep(3)
             continue
 
@@ -425,17 +504,37 @@ def _call_one_provider(provider: dict, body: dict) -> str:
                 f"{reason}. Provider said: {detail or '(no body)'}", permanent=True
             )
         if resp.status_code == 429:
+            rate_limited = True
             last_error = "rate limited (429)"
-            wait = min(2**attempt * 5, 30)
-            print(f"  Rate limited, retrying in {wait}s...")
+            stated = _retry_after_seconds(resp)
+            # A quota that renews in ten minutes is not something to sleep on
+            # when another provider is one round-trip away.
+            if stated is not None and stated > MAX_RETRY_AFTER_WAIT:
+                raise _ProviderFailure(
+                    f"rate limited (429) — provider asks for "
+                    f"{_format_wait(stated)}, longer than this run will wait",
+                    exhausted=True,
+                )
+            if final:
+                break
+            wait = stated if stated is not None else min(2**attempt * 5, 30)
+            print(f"  Rate limited, retrying in {_format_wait(wait)}...")
             time.sleep(wait)
             continue
         # Retry transient 5xx (bad gateway / overload / upstream timeout) —
         # these are common from proxies and usually recover on a second try.
         if 500 <= resp.status_code < 600:
             last_error = f"HTTP {resp.status_code}: {(resp.text or '')[:200]}"
-            wait = min(2**attempt * 3, 20)
-            print(f"  LLM {resp.status_code}, retrying in {wait}s...")
+            if final:
+                break
+            stated = _retry_after_seconds(resp)
+            if stated is not None and stated > MAX_RETRY_AFTER_WAIT:
+                raise _ProviderFailure(
+                    f"{last_error} — provider asks for {_format_wait(stated)}, "
+                    "longer than this run will wait"
+                )
+            wait = stated if stated is not None else min(2**attempt * 3, 20)
+            print(f"  LLM {resp.status_code}, retrying in {_format_wait(wait)}...")
             time.sleep(wait)
             continue
         # Any other 4xx is a request this provider won't serve — an unknown
@@ -456,7 +555,11 @@ def _call_one_provider(provider: dict, body: dict) -> str:
             # caller's — let the next one try before giving up on the run.
             raise _ProviderFailure(str(e)) from e
 
-    raise _ProviderFailure(f"failed after 3 attempts ({last_error or 'unknown'})")
+    raise _ProviderFailure(
+        f"failed after {LLM_ATTEMPTS_PER_PROVIDER} attempts "
+        f"({last_error or 'unknown'})",
+        exhausted=rate_limited,
+    )
 
 
 def call_llm(
@@ -476,8 +579,9 @@ def call_llm(
     failures: list[str] = []
     for provider in providers:
         label = f"{provider['endpoint']} (model={provider['model']})"
-        if _provider_id(provider) in _DEAD_PROVIDERS:
-            failures.append(f"{label}: skipped, already failed earlier this run")
+        prior = _DEAD_PROVIDERS.get(_provider_id(provider))
+        if prior:
+            failures.append(f"{label}: skipped — already failed this run ({prior})")
             continue
         body = _llm_request_body(
             provider, system_prompt, messages, max_tokens, temperature
@@ -485,8 +589,8 @@ def call_llm(
         try:
             return _call_one_provider(provider, body)
         except _ProviderFailure as e:
-            if e.permanent:
-                _DEAD_PROVIDERS.add(_provider_id(provider))
+            if e.exhausted:
+                _DEAD_PROVIDERS[_provider_id(provider)] = e.reason
             failures.append(f"{label}: {e.reason}")
             if len(providers) > 1:
                 print(f"  LLM provider failed ({label}): {e.reason}")
